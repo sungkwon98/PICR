@@ -1,0 +1,429 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{MCGDF\_object\_mlp:\\Robot + Object World Model with a Pure-MLP Object Side}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+The implementation under
+\begin{center}
+\texttt{scripts/world\_model/Physics/Robot\_and\_Object/MCGDF\_object\_mlp}
+\end{center}
+is a deliberate fork of the MCGDF model in the sibling folder
+\texttt{MCGDF/} with one structural change on the object side:
+\textbf{the Newton--Euler object integrator is removed entirely}.  In
+its place, a single MLP head (\texttt{ObjectStateMLP}) emits the
+13-dimensional next object substate directly from the current
+$(s_t, \tau_t)$, with FiLM modulation by the variational latent
+context $z$.
+
+The robot side is unchanged from MCGDF: DeLaN-structured inertia /
+Coriolis / gravity terms; an implicit-PD residual head $r_\theta$; the
+joint damping / friction parameters; the analytic Franka FK +
+geometric Jacobian; and the action--reaction torque
+$\tau_{\mathrm{contact}} = -J_c^\top F_c$ that flows from a
+still-learned contact wrench $F_c$.  All of those are preserved.
+
+This document describes the architecture, the precise role the
+contact wrench $F_c$ plays now that it no longer enters an object
+integrator, the design space the new head explores, the impact on
+training losses, and the asymmetric physical inductive bias compared
+to its three sibling variants.
+
+\section{State, Input, and Context}
+
+State and input are identical to MCGDF:
+\begin{equation}
+  s_t =
+  \begin{bmatrix}
+    q_t \\ \dot q_t \\ p^o_t \\ r^o_t \\ v^o_t \\ \omega^o_t
+  \end{bmatrix} \in \mathbb{R}^{18 + 13} = \mathbb{R}^{31},
+  \qquad
+  \tau_t \in \mathbb{R}^{9}.
+\end{equation}
+The per-episode physical context $\xi = [m_o,\,I_b\,\mathrm{(9)},\,
+\mu_o\,(3)] \in \mathbb{R}^{13}$ is still loaded by the dataset and
+still consumed by the \texttt{ContactWrenchHead} (so $F_c$ knows the
+nominal physical context); it is \emph{not} consumed by the new
+\texttt{ObjectStateMLP}.  The variational latent $z$ is produced by
+the existing \texttt{ContextEncoder} from the $K$-step history window
+exactly as in MCGDF.
+
+\section{Forward Dynamics}
+
+\subsection{Robot side (unchanged from MCGDF)}
+
+\begin{equation}
+  H(q,z)\,\ddot q
+  \;=\;
+  \tau + r_\theta(q,\dot q,\tau,z)
+  - c(q,\dot q,z) - g(q,z)
+  - d\dot q - f\tanh(\dot q/\varepsilon_f)
+  - J_c(q)^\top F_c(s,\tau,\xi,z),
+  \label{eq:om-robot}
+\end{equation}
+followed by semi-implicit Euler for the robot kinematics:
+\begin{equation}
+  \dot q_{t+1} = \dot q_t + \ddot q_t\,\Delta t,
+  \qquad
+  q_{t+1} = q_t + \dot q_{t+1}\,\Delta t.
+\end{equation}
+Eq.~\eqref{eq:om-robot} is identical to MCGDF.  The contact wrench
+$F_c \in \mathbb{R}^6$ is still predicted by
+\texttt{ContactWrenchHead}; it is still applied to the robot side via
+Newton's third law.  What changes is that $F_c$ \emph{does not enter}
+the object integrator anymore.  The MLP-based object head
+(Section~\ref{sec:om-object}) is the sole determinant of
+$(p^o_{t+1}, r^o_{t+1}, v^o_{t+1}, \omega^o_{t+1})$.
+
+\subsection{Object side: a single MLP}
+\label{sec:om-object}
+
+The Newton--Euler equations
+$m_o \dot v^o = m_o g + F_c^{\mathrm{lin}}$ and
+$I_w \dot \omega^o + \omega^o\!\times\!I_w\omega^o = F_c^{\mathrm{ang}}$
+are \emph{removed}.  In their place, a single MLP head
+\texttt{ObjectStateMLP} emits the next 13-D object substate
+directly:
+\begin{equation}
+  \hat o_{t+1}
+  \;=\;
+  \mathrm{ObjectStateMLP}(s_t,\,\tau_t,\,z)
+  \;\in\; \mathbb{R}^{13}.
+  \label{eq:om-objmlp}
+\end{equation}
+The 13 output dimensions are interpreted slot-by-slot as
+\begin{equation}
+  \hat o_{t+1}
+  \;=\;
+  \bigl(
+    \hat p^o_{t+1}\,(3),\,
+    \tilde r^o_{t+1}\,(4),\,
+    \hat v^o_{t+1}\,(3),\,
+    \hat \omega^o_{t+1}\,(3)
+  \bigr),
+\end{equation}
+where the quaternion slot $\tilde r^o_{t+1}$ is normalized to unit
+length before being written into the next state:
+\begin{equation}
+  r^o_{t+1} \;=\; \frac{\tilde r^o_{t+1}}{\|\tilde r^o_{t+1}\| + \varepsilon_q}.
+\end{equation}
+This single normalization step is the entire amount of analytic
+geometry that survives on the object side; there is no
+exp-map quaternion integrator, no semi-implicit Euler on
+$(v^o, p^o)$, and no inertia or mass anywhere.
+
+\subsection{ObjectStateMLP architecture}
+
+\texttt{ObjectStateMLP} reuses the same FiLM pattern as
+\texttt{ResidualTorqueHead} and \texttt{ContactWrenchHead}:
+\begin{lstlisting}
+in   = cat(state, torque)         # in R^{state_dim + torque_dim} = R^{40}
+h    = SiLU(Linear_in(in))        # in R^{hidden_dim}        (= 256 default)
+for i in 1..depth:                # depth FiLM blocks         (= 3 default)
+    h = FiLM_i(h, z)              #   h <- SiLU(gamma_i(z) * Linear_i(h) + beta_i(z))
+out  = Linear_out(h)              # in R^{13}
+\end{lstlisting}
+Each \texttt{FiLM\_i} is the existing \texttt{FiLMLayer}: an inner
+linear projection whose output is element-wise affine-modulated by
+\((\gamma_i(z), \beta_i(z))\) from two small linear maps of $z$, then
+passed through SiLU.  When the context encoder is off, the head
+gracefully falls back to a plain MLP without FiLM
+(\texttt{latent\_dim is None}).
+
+\paragraph{Two new CLI flags.}
+\texttt{--object\_mlp\_hidden\_dim} (default $256$) and
+\texttt{--object\_mlp\_depth} (default $3$) control the head's size.
+They are saved into the checkpoint config and rehydrated by the
+checkpoint loader in \texttt{plot\_multistep\_trajectory.py} and
+\texttt{animate\_episode.py}.
+
+\section{Why $F_c$ Is Still Predicted}
+
+The contact wrench $F_c \in \mathbb{R}^6$ from
+\texttt{ContactWrenchHead} no longer drives the object dynamics, but
+it is \emph{not} dropped.  Three reasons:
+
+\begin{enumerate}
+  \item \textbf{Robot-side action--reaction (Newton's third law).}
+    The robot ODE
+    Eq.~\eqref{eq:om-robot} still relies on
+    $\tau_{\mathrm{contact}} = -J_c^\top F_c$.  If the cube is being
+    carried, there must be an upward reaction torque on the gripper;
+    if the cube resists motion, there must be a backward reaction
+    torque.  Predicting that reaction with a structured wrench (rather
+    than absorbing it into $r_\theta$) keeps the robot-side dynamics
+    interpretable and avoids the identifiability collapse documented
+    in the MCGDF description's residual section.
+  \item \textbf{Continuity with the rest of the codebase.}  Existing
+    losses
+    ($\mathcal{L}_{\mathrm{contact\,L2}} = \lambda_{\mathrm{contact}}\|F_c\|^2$,
+    the auxiliary $F_c$ diagnostics in
+    \texttt{aux["contact\_wrench"]} / \texttt{aux["tau\_contact"]}),
+    and the existing animation / signal-panel overlays all keep
+    working without modification.
+  \item \textbf{Optional future re-coupling.}  Keeping $F_c$ alive
+    leaves the door open to feeding $\|F_c^{\mathrm{lin}}\|$ as an
+    extra input to the \texttt{ObjectStateMLP} (matching the
+    coupling-gate trick in \texttt{No\_object\_Euler}), if you ever
+    want to re-introduce a soft physical link.  Today $F_c$ flows
+    only to the robot side.
+\end{enumerate}
+
+\section{Auxiliary Outputs and Loss Compatibility}
+\label{sec:om-aux}
+
+The step's \texttt{aux} dict still emits keys downstream consumers
+expect, so the training script and evaluation tooling continue to
+work \emph{without} edits to the loss code.  The semantics of two
+families of keys changes, however, and is documented here.
+
+\paragraph{Robot-side keys.}  Unchanged.  $H,\,c,\,g,\,
+\ddot q,\,r_\theta,\,F_c,\,\tau_{\mathrm{contact}}$, and the
+inverse-dynamics composite \texttt{full\_inverse\_dynamics\_tau} are
+still produced exactly as in MCGDF.
+
+\paragraph{Object-side keys.}  Re-interpreted as
+\emph{finite-difference diagnostics}, not physical quantities:
+\begin{align}
+  \texttt{object\_lin\_acc}
+    &= (\hat v^o_{t+1} - v^o_t) / \Delta t,
+    \label{eq:om-fd-lin}\\
+  \texttt{object\_ang\_acc}
+    &= (\hat \omega^o_{t+1} - \omega^o_t) / \Delta t,
+    \label{eq:om-fd-ang}\\
+  \texttt{object\_gravity\_acc}
+    &= (0,\,0,\,-9.81),\;\text{constant placeholder},\\
+  \texttt{object\_inertial\_force},\;
+  \texttt{object\_gravity\_force}
+    &= \mathbf{0}\;\text{(no mass is available to scale these)}.
+\end{align}
+Eqs.~\eqref{eq:om-fd-lin}--\eqref{eq:om-fd-ang} are FD-derived
+accelerations on top of the MLP's predicted velocities; they let
+\texttt{supervised\_object\_dynamics\_loss} keep producing a signal
+(it MSEs them against the recorded $\dot v^o_w / \dot \omega^o_w$),
+which in turn constrains the MLP to produce kinematically consistent
+velocity changes.  They are \emph{not} physical accelerations -- in
+particular they do not satisfy $F = m a$, since $F_c$ never entered
+this calculation.
+
+Two new aux keys are emitted as a convenience:
+\begin{itemize}
+  \item \texttt{object\_state\_pred\_raw}: the raw 13-D MLP output
+    before quaternion normalization.  Useful for monitoring whether
+    the quaternion slot's pre-normalization norm collapses near 0
+    (which would make the post-normalization quaternion noisy).
+  \item \texttt{object\_quat\_next\_raw}: the unnormalized quaternion
+    slot \(\tilde r^o_{t+1}\), for the same monitoring purpose.
+\end{itemize}
+
+\section{Trajectory Prediction (rollout)}
+
+A predicted trajectory over horizon $H$ is produced exactly as in
+MCGDF, by chaining $H$ calls to the per-step dynamics with the latent
+$z$ frozen across the rollout:
+\begin{equation}
+  s_{t+h+1} \;=\; \mathrm{RobotObjectMCGDFStep}\bigl(s_{t+h},\,\tau_{t+h+1},\,\xi,\,z\bigr),
+  \qquad h = 0, 1, \dots, H-1.
+  \label{eq:om-rollout}
+\end{equation}
+The recursion is the standard Python \texttt{for} loop in
+\texttt{MultiStepRobotObjectMCGDFWorldModel.forward}; no changes
+relative to MCGDF were needed there.
+
+\paragraph{Where the learned signal flows.}
+At step $h$ of the rollout, the predicted object substate at step
+$h+1$ is entirely determined by the 13-D output of the
+\texttt{ObjectStateMLP} evaluated at $(s_{t+h}, \tau_{t+h+1}, z)$.
+The robot substate at step $h+1$ is still co-driven by $F_c$ via the
+DeLaN ODE on the robot side.  So in this variant the object trajectory
+has a 13-D learned bottleneck (vs.\ MCGDF's 6-D contact-wrench
+bottleneck, which then went through Newton--Euler), while the robot
+trajectory is still mediated by the structured 6-D $F_c$.
+
+\section{Sub-network Inventory}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.28\linewidth} p{0.32\linewidth} p{0.18\linewidth} p{0.10\linewidth}}
+\toprule
+Sub-network (class)              & Input                                  & Output                       & Hidden \\
+\midrule
+\texttt{g\_net} (MLP)            & $q \in \mathbb{R}^9$                  & $g \in \mathbb{R}^9$         & 256    \\
+\texttt{l\_diag\_net} (Deriv.\,MLP) & $q \in \mathbb{R}^9$              & $\ell_d \in \mathbb{R}^9$    & 256    \\
+\texttt{l\_offdiag\_net} (Deriv.\,MLP) & $q \in \mathbb{R}^9$           & $\ell_o \in \mathbb{R}^{36}$ & 256    \\
+\texttt{ResidualTorqueHead}      & $(q,\dot q,\tau) \in \mathbb{R}^{27}$ & $r_\theta \in \mathbb{R}^9$  & 128    \\
+\texttt{ContactWrenchHead}       & $(s,\tau,\xi) \in \mathbb{R}^{53}$    & $F_c \in \mathbb{R}^6$       & 128    \\
+\texttt{ObjectStateMLP}          & $(s,\tau) \in \mathbb{R}^{40}$        & $\hat o_{t+1} \in \mathbb{R}^{13}$ & 256 \\
+\texttt{ContextEncoder} (VAE)    & flat history of $(s,\tau)$ over $K$ steps & $(\mu,\log\sigma^2) \in \mathbb{R}^{2\,\mathrm{ld}}$ & 256 \\
+\texttt{JointDampingFrictionParams} (opt.) & ---                         & $9+9$ scalars                & ---    \\
+\bottomrule
+\end{tabular}
+\caption{Trainable sub-networks of the MCGDF\_object\_mlp variant.
+The new row is \texttt{ObjectStateMLP}; all other heads are
+inherited from MCGDF.  ld $=$ \texttt{latent\_dim}; default $=8$.}
+\label{tab:om-subnets}
+\end{table}
+
+The whole object side is therefore a single MLP plus a 4-D
+quaternion normalization.  No analytic integration, no inertia
+tensor, no mass, no gravity, no gyroscopic correction.
+
+\section{What Is Gained and Lost}
+
+\paragraph{Gained.}
+\begin{itemize}
+  \item \emph{Expressivity.}  An unconstrained 13-D regressor can
+    represent any one-step object motion that lies inside the
+    network's capacity, including non-rigid-body effects (slip in the
+    pinch, micro-vibration, finger compliance, contact transitions)
+    that the original Newton--Euler integrator literally cannot
+    express because they violate $F = m a$ at fixed $(m_o, I_b)$.
+  \item \emph{No oracle physics at inference.}  The Newton--Euler
+    integrator in MCGDF consumed $m_o$ and $I_b$ from the dataset's
+    $\xi$.  This variant's \texttt{ObjectStateMLP} does not -- so a
+    deployment-time evaluation where $\xi$ is unknown does not need a
+    $\hat\xi(z)$ regression head for the object side (the
+    contact-head consumer of $\xi$ is the only remaining channel
+    where $\xi$ enters the forward pass).
+  \item \emph{Architectural simplicity.}  The whole object side
+    collapses to one MLP forward call.  No quaternion exp map, no
+    Cholesky-style inertia, no inertia rotation.
+\end{itemize}
+
+\paragraph{Lost.}
+\begin{itemize}
+  \item \emph{All physical inductive bias on the object side.}  The
+    model now has to learn $F = m a$, the gyroscopic correction, the
+    persistence of gravity, the kinematic identity
+    $\dot p = v$, and the rotation update law -- all from data, with
+    no structural prior.  Out-of-distribution behaviour is therefore
+    much harder to bound than in MCGDF.
+  \item \emph{Quaternion-on-the-sphere structure.}  Pure-MLP
+    regression to a 4-D vector + normalization does \emph{not}
+    preserve the geodesic geometry of \(SO(3)\): the loss can have
+    bad local minima near antipodal quaternions, the network can
+    pick the wrong hemisphere, and small numerical errors can
+    accumulate into a drift on the sphere across long rollouts.  The
+    \texttt{weighted\_rollout\_mse} already uses a sign-invariant
+    quaternion MSE which helps a little.
+  \item \emph{Stiff coupling between $F_c$ and the cube is gone.}
+    MCGDF's $F_c$ \emph{had to} produce the observed cube
+    acceleration via $F = m a$; here, $F_c$ is decoupled from the
+    cube on the object side, so there is no longer a structural
+    constraint forcing $F_c$ to be physically meaningful.  Adding
+    L2 regularization on $\|F_c\|$ remains essential.
+  \item \emph{No analytic energy bound.}  MCGDF's Newton--Euler
+    integrator preserves total kinetic energy up to the work done by
+    $F_c$.  The pure-MLP integrator can produce trajectories with
+    arbitrary energy creation / dissipation per step -- there is no
+    structural guarantee.
+\end{itemize}
+
+\section{Comparison with the Sibling Models}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.20\linewidth} p{0.34\linewidth} p{0.20\linewidth} p{0.16\linewidth}}
+\toprule
+Model & Object-side equation & Learned signal driving the object & Physical prior \\
+\midrule
+\textbf{MCGDF} & Newton--Euler:
+\(m_o\dot v^o = m_o g + F_c^{\mathrm{lin}}\),
+\(I_w \dot\omega^o + \omega^o\!\times\! I_w\omega^o = F_c^{\mathrm{ang}}\) +
+semi-implicit Euler + exp-map quat
+& Contact wrench $F_c \in \mathbb{R}^6$
+& Strong: $F=ma$, gyroscopic Euler, world-frame inertia, quat-exp \\
+\textbf{No-Object-Euler} & Kinematic blend:
+\(v^o_{t+1} = \alpha_t v_g + (1-\alpha_t)\rho_v v^o_t\)
+(symmetric for $\omega^o$) + exp-map quat
+& Coupling factor $\alpha_t \in [0,1]$ (gated by $\|F_c^{\mathrm{lin}}\|$ and $z$)
+& Medium: carry vs.\ release dichotomy + quat-exp \\
+\textbf{Context DeLaN} & Acceleration head:
+\((\dot v^o, \dot\omega^o) = \mathrm{MLP}(s,\tau,z)\) + semi-implicit Euler + exp-map quat
+& The 6-D acceleration vector
+& Low: integrators preserve kinematic identities, but no $F=ma$ \\
+\textbf{MCGDF\_object\_mlp} (this) & Next-state head:
+\(\hat o_{t+1} = \mathrm{MLP}(s,\tau,z)\), quaternion slot normalized
+& The 13-D next-state vector itself
+& \emph{None.}  No analytic integrator, no $F=ma$, no quat-exp. \\
+\bottomrule
+\end{tabular}
+\caption{Object-side comparison across the four sibling models in
+\texttt{Robot\_and\_Object/}.  Reading left-to-right inside the
+``Physical prior'' column lays out the four variants on a
+strong-to-none spectrum.}
+\label{tab:om-vs-others}
+\end{table}
+
+This variant sits at the most flexible end of the spectrum: it makes
+the weakest physical assumption on the object side of any of the four
+sibling implementations.  That makes it the natural baseline for
+``how far can a pure MLP go on this task'' and the natural
+upper-bound capacity comparison against the structured
+\texttt{MCGDF} and \texttt{No\_object\_Euler} variants.
+
+\section{Practical Notes}
+
+\paragraph{Training.}  No changes to losses are required.
+\texttt{wm\_train.py} produces exactly the same loss surface as
+MCGDF, including the supervised
+$\dot v^o / \dot \omega^o$ MSE -- which now constrains the
+finite-differenced velocities of the MLP rather than the analytic
+Newton--Euler accelerations.  In our experience the rollout MSE on
+position is the dominant signal for this variant; the supervised
+acceleration losses can be down-weighted (e.g.\
+\texttt{--lambda\_object\_lin\_acc 0} and
+\texttt{--lambda\_object\_ang\_acc 0}) without major regression.
+
+\paragraph{Evaluation.}  The existing
+\texttt{plot\_multistep\_trajectory.py},
+\texttt{animate\_episode.py}, \texttt{plot\_episode\_dynamics.py},
+and \texttt{plot\_pred\_error\_heavy\_light.py} all keep working.
+The animation script's signal panel still draws
+\texttt{contact\_wrench\_lin} / \texttt{contact\_wrench\_ang} from
+\texttt{aux} -- those panels now describe the robot-side $F_c$ only;
+they no longer tell you anything about the object's acceleration.
+
+\paragraph{Where to look in the code.}
+\begin{itemize}
+  \item \texttt{models.py}: new class \texttt{ObjectStateMLP};
+    modified \texttt{RobotObjectMCGDFStep.\_\_init\_\_} (adds the
+    head), \texttt{RobotObjectMCGDFStep.forward} (replaces the
+    Newton--Euler block with the MLP call + quaternion normalization
+    + FD-diagnostic aux fields), and
+    \texttt{MultiStepRobotObjectMCGDFWorldModel.\_\_init\_\_} (passes
+    the two new size flags through).
+  \item \texttt{wm\_train.py}: new \texttt{TrainConfig} fields
+    \texttt{object\_mlp\_hidden\_dim} and \texttt{object\_mlp\_depth},
+    new CLI flags of the same names, plumbed into the model
+    constructor.
+  \item \texttt{plot\_multistep\_trajectory.py} and
+    \texttt{animate\_episode.py}: their \texttt{load\_checkpoint\_model}
+    helpers read the two new fields from \texttt{cfg} with sensible
+    defaults so older MCGDF checkpoints can still be loaded
+    side-by-side.
+\end{itemize}
+
+\end{document}
