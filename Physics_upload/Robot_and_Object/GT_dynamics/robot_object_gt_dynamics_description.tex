@@ -1,0 +1,808 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{Robot-and-Object GT-Dynamics-Supervised Hybrid DeLaN World Model}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+The implementation under
+\begin{center}
+\texttt{scripts/world\_model/Physics/Robot\_and\_Object/GT\_dynamics}
+\end{center}
+trains a torque-driven hybrid world model for Franka lift episodes. It extends
+the robot-only GT-dynamics model by including the manipulated object's state,
+object physical context, object dynamics labels, and a learned residual contact
+coupling term.
+
+The robot part remains DeLaN-style and predicts structured robot dynamics terms:
+\begin{equation}
+  H(q), \qquad c(q,\dot{q}), \qquad g(q).
+\end{equation}
+The object/contact part is learned with MLPs conditioned on the full robot-object
+state, recorded robot torque, and object context. It predicts
+\begin{align}
+  \tau_{\mathrm{res}} &= f_{\theta}^{\tau}(s_t,\tau_t,\xi), \\
+  a_o &= f_{\theta}^{o}(s_t,\tau_t,\xi),
+\end{align}
+where \(\tau_{\mathrm{res}}\) is a residual generalized torque and \(a_o\)
+contains object linear and angular accelerations.
+
+This design is hybrid rather than a single full-system DeLaN model. The HDF5
+dataset contains clean robot dynamics labels and rigid-object state/force labels,
+but it does not contain a clean full generalized robot-object mass matrix with
+contact constraints. Therefore, the implementation preserves the structured
+robot dynamics and learns contact/object effects as additional supervised terms.
+
+\section{State, Input, and Context}
+
+The model uses \(n=9\) robot degrees of freedom by default: seven Franka arm
+joints and two gripper finger joints. The robot state is
+\begin{equation}
+  s^r_t =
+  \begin{bmatrix}
+    q_t \\
+    \dot{q}_t
+  \end{bmatrix}
+  \in \mathbb{R}^{18}.
+\end{equation}
+
+The object state is
+\begin{equation}
+  s^o_t =
+  \begin{bmatrix}
+    p^o_t \\
+    r^o_t \\
+    v^o_t \\
+    \omega^o_t
+  \end{bmatrix}
+  \in \mathbb{R}^{13},
+\end{equation}
+where \(p^o_t \in \mathbb{R}^3\) is object position,
+\(r^o_t \in \mathbb{R}^4\) is a unit quaternion in \texttt{wxyz} order,
+\(v^o_t \in \mathbb{R}^3\) is linear velocity, and
+\(\omega^o_t \in \mathbb{R}^3\) is angular velocity.
+
+The full state is
+\begin{equation}
+  s_t =
+  \begin{bmatrix}
+    q_t \\
+    \dot{q}_t \\
+    p^o_t \\
+    r^o_t \\
+    v^o_t \\
+    \omega^o_t
+  \end{bmatrix}
+  \in \mathbb{R}^{31}.
+\end{equation}
+
+The dynamics input is the recorded robot torque
+\begin{equation}
+  \tau_t \in \mathbb{R}^{9}.
+\end{equation}
+The torque is not predicted by the model. It is read from the dataset using
+\texttt{robot\_torques/applied\_torque} or
+\texttt{robot\_torques/computed\_torque}.
+
+The model also receives an object context vector
+\begin{equation}
+  \xi =
+  \begin{bmatrix}
+    m_o \\
+    I_o \\
+    \mu_o
+  \end{bmatrix}
+  \in \mathbb{R}^{13},
+\end{equation}
+where \(m_o \in \mathbb{R}\) is object mass,
+\(I_o \in \mathbb{R}^9\) is the recorded inertia vector, and
+\(\mu_o \in \mathbb{R}^3\) is the recorded material-property vector.
+
+\section{Expected Dataset Fields}
+
+Each HDF5 episode is expected to contain robot observations and recorded torque:
+\begin{lstlisting}
+obs/joint_pos
+obs/joint_vel
+actions
+robot_torques/applied_torque
+robot_torques/computed_torque
+\end{lstlisting}
+
+The robot GT dynamics labels are:
+\begin{lstlisting}
+robot_dynamics/qdd
+robot_dynamics/mass_matrix
+robot_dynamics/inertial
+robot_dynamics/coriolis
+robot_dynamics/gravity
+robot_dynamics/inverse_dynamics_tau
+\end{lstlisting}
+
+The object state and object dynamics labels are:
+\begin{lstlisting}
+states/rigid_object/object/root_pose
+states/rigid_object/object/root_velocity
+object_dynamics/root_lin_acc_w
+object_dynamics/root_ang_acc_w
+object_dynamics/mass
+object_dynamics/inertia
+object_dynamics/material_properties
+object_dynamics/inertial_force_w
+object_dynamics/gravity_force_w
+object_dynamics/external_force_est_w
+\end{lstlisting}
+
+The current default dataset path in \texttt{wm\_train.py} is:
+\begin{lstlisting}
+../../../../reinforcement_learning/skrl/datasets/Lift_RL_opt_robot_object_dynamics_10000ep.hdf5
+\end{lstlisting}
+
+\section{Training Samples}
+
+The dataset class is
+\begin{center}
+\texttt{RobotObjectGTDynamicsRolloutDataset}.
+\end{center}
+It builds sliding-window samples without crossing episode boundaries. Each sample
+contains
+\begin{align}
+  \texttt{history\_states} &\in \mathbb{R}^{K_h \times 31}, \\
+  \texttt{future\_torques} &\in \mathbb{R}^{H \times 9}, \\
+  \texttt{future\_states} &\in \mathbb{R}^{H \times 31}, \\
+  \texttt{object\_context} &\in \mathbb{R}^{13}.
+\end{align}
+Here \(K_h\) is \texttt{history\_len} and \(H\) is
+\texttt{rollout\_horizon}.
+
+The loader also returns:
+\begin{lstlisting}
+future_robot_dynamics
+future_object_dynamics
+history_actions
+future_actions
+\end{lstlisting}
+The action tensors are kept for compatibility and inspection, but the current
+model uses recorded torque as its dynamics input.
+
+Unlike the robot-only pre-contact experiment, the default robot-and-object
+trainer keeps contact windows:
+\begin{lstlisting}
+filter_pre_contact = False
+\end{lstlisting}
+This is intentional because the goal of this model is to reduce the large error
+that appears when the robot contacts and carries the object. A pre-contact-only
+filter can still be enabled with
+\begin{lstlisting}[language=bash]
+python wm_train.py --filter_pre_contact
+\end{lstlisting}
+
+\section{Model Input and Output}
+
+The main rollout model is
+\begin{center}
+\texttt{MultiStepRobotObjectGTDynamicsWorldModel}.
+\end{center}
+Its forward input is
+\begin{align}
+  \texttt{history\_states} &\in \mathbb{R}^{B \times K_h \times 31}, \\
+  \texttt{future\_torques} &\in \mathbb{R}^{B \times H \times 9}, \\
+  \texttt{object\_context} &\in \mathbb{R}^{B \times 13}.
+\end{align}
+
+As in the robot-only GT-dynamics model, the current implementation uses the most
+recent state in the history:
+\begin{equation}
+  \hat{s}_t = \texttt{history\_states}_{:, -1}.
+\end{equation}
+The future torques are taken from the dataset and supplied step by step.
+
+The output is an open-loop predicted rollout:
+\begin{equation}
+  \hat{S}_{t+1:t+H}
+  =
+  \left[
+    \hat{s}_{t+1},
+    \hat{s}_{t+2},
+    \ldots,
+    \hat{s}_{t+H}
+  \right]
+  \in \mathbb{R}^{B \times H \times 31}.
+\end{equation}
+
+If \texttt{return\_aux=True}, the model also returns auxiliary predictions:
+\begin{lstlisting}
+H
+L
+l_diag
+l_offdiag
+g
+coriolis
+torque
+tau_residual
+effective_torque
+ddq
+inertial
+inverse_dynamics_tau
+object_lin_acc
+object_ang_acc
+object_inertial_force
+object_gravity_force
+object_external_force
+\end{lstlisting}
+
+\section{Robot DeLaN-Style Structured Dynamics}
+
+The robot structured terms are computed by
+\begin{center}
+\texttt{DeLaNStructuredTerms}.
+\end{center}
+The implementation is the same basic construction as the robot-only GT-dynamics
+model. The network directly outputs
+\begin{align}
+  g(q) &\in \mathbb{R}^{n}, \\
+  l_d(q) &\in \mathbb{R}^{n}, \\
+  l_o(q) &\in \mathbb{R}^{n(n-1)/2}.
+\end{align}
+The diagonal output is passed through softplus:
+\begin{equation}
+  L_{ii}(q) = \mathrm{softplus}(l_{d,i}(q)) + \epsilon_d.
+\end{equation}
+The inertia matrix is constructed as
+\begin{equation}
+  H(q) = L(q)L(q)^\top + \epsilon I,
+\end{equation}
+which enforces positive definiteness up to numerical precision.
+
+The Coriolis and centrifugal term is computed from the learned inertia structure:
+\begin{equation}
+  c(q,\dot{q})
+  =
+  \dot{H}(q,\dot{q})\dot{q}
+  -
+  \frac{1}{2}
+  \nabla_q
+  \left(
+    \dot{q}^{\top}H(q)\dot{q}
+  \right).
+\end{equation}
+The implementation uses a custom \texttt{DerivativeMLP} to propagate
+\(\partial L/\partial q\) through the network.
+
+\section{Residual Contact Torque}
+
+The robot-only model solves
+\begin{equation}
+  H(q_t)\ddot{q}_t =
+  \tau_t - c(q_t,\dot{q}_t) - g(q_t).
+\end{equation}
+This ignores contact and object-carrying effects except through the recorded
+robot motion. The robot-and-object model introduces a learned residual
+generalized torque:
+\begin{equation}
+  \tau_{\mathrm{eff},t}
+  =
+  \tau_t
+  +
+  \tau_{\mathrm{res},t}.
+\end{equation}
+The residual is predicted from the full state, torque, and object context:
+\begin{equation}
+  \tau_{\mathrm{res},t}
+  =
+  f_{\theta}^{\tau}
+  \left(
+    s_t,
+    \tau_t,
+    \xi
+  \right).
+\end{equation}
+
+The robot forward dynamics equation becomes
+\begin{equation}
+  H(q_t)\ddot{q}_t
+  =
+  \tau_t
+  +
+  \tau_{\mathrm{res},t}
+  -
+  c(q_t,\dot{q}_t)
+  -
+  g(q_t).
+\end{equation}
+In code, this is implemented as:
+\begin{lstlisting}[language=Python]
+effective_torque = torque + tau_residual
+rhs = (effective_torque - g - coriolis).unsqueeze(-1)
+ddq = torch.linalg.solve(H, rhs).squeeze(-1)
+\end{lstlisting}
+
+The residual target used by the supervised loss is
+\begin{equation}
+  \tau_{\mathrm{res,GT}}
+  =
+  \tau_{\mathrm{ID,GT}}
+  -
+  \tau_t,
+\end{equation}
+where
+\begin{equation}
+  \tau_{\mathrm{ID,GT}}
+  =
+  M_{\mathrm{GT}}\ddot{q}_{\mathrm{GT}}
+  +
+  c_{\mathrm{GT}}
+  +
+  g_{\mathrm{GT}}.
+\end{equation}
+This target should be interpreted as a useful residual supervision signal, not
+as a perfect measured contact force. It includes whatever mismatch exists
+between recorded actuator torque and the PhysX inverse-dynamics label.
+
+\section{Object Dynamics and Integration}
+
+The object head predicts six values:
+\begin{equation}
+  a^o_t =
+  \begin{bmatrix}
+    \dot{v}^o_t \\
+    \dot{\omega}^o_t
+  \end{bmatrix}
+  =
+  f_{\theta}^{o}(s_t,\tau_t,\xi)
+  \in \mathbb{R}^{6}.
+\end{equation}
+The first three dimensions are object linear acceleration and the last three are
+object angular acceleration.
+
+The object velocity and position are integrated with semi-implicit Euler:
+\begin{align}
+  v^o_{t+1} &= v^o_t + \dot{v}^o_t \Delta t, \\
+  p^o_{t+1} &= p^o_t + v^o_{t+1}\Delta t, \\
+  \omega^o_{t+1} &= \omega^o_t + \dot{\omega}^o_t \Delta t.
+\end{align}
+
+The quaternion is updated using the predicted angular velocity:
+\begin{equation}
+  \dot{r}^o_t
+  =
+  \frac{1}{2}
+  \begin{bmatrix}
+    0 \\
+    \omega^o_{t+1}
+  \end{bmatrix}
+  \otimes
+  r^o_t,
+\end{equation}
+followed by Euler integration and normalization:
+\begin{equation}
+  r^o_{t+1}
+  =
+  \mathrm{normalize}
+  \left(
+    r^o_t + \dot{r}^o_t \Delta t
+  \right).
+\end{equation}
+
+The model also computes predicted object forces:
+\begin{align}
+  \hat{F}_{\mathrm{inertial}} &= m_o \hat{\dot{v}}^o, \\
+  \hat{F}_{g} &= m_o
+  \begin{bmatrix}
+    0 & 0 & -9.81
+  \end{bmatrix}^{\top}, \\
+  \hat{F}_{\mathrm{ext}} &=
+  \hat{F}_{\mathrm{inertial}} - \hat{F}_{g}.
+\end{align}
+The external force prediction is supervised against
+\texttt{object\_dynamics/external\_force\_est\_w}.
+
+\section{Open-Loop Multi-Step Rollout}
+
+The model is trained recursively in open loop. The initial state is the real
+dataset state:
+\begin{equation}
+  \hat{s}_t = s_t.
+\end{equation}
+For each future step \(h=0,\ldots,H-1\),
+\begin{equation}
+  \hat{s}_{t+h+1}
+  =
+  f_{\theta}
+  \left(
+    \hat{s}_{t+h},
+    \tau_{t+h},
+    \xi
+  \right).
+\end{equation}
+The future torques are always taken from the HDF5 dataset. After the first step,
+the model feeds its own predicted robot and object state back into the next
+dynamics step.
+
+\section{Training Objective}
+
+The total training loss is
+\begin{equation}
+  \mathcal{L}
+  =
+  \mathcal{L}_{\mathrm{rollout}}
+  +
+  \mathcal{L}_{\mathrm{robotGT}}
+  +
+  \mathcal{L}_{\mathrm{objectGT}}
+  +
+  \mathcal{L}_{\mathrm{reg}}
+  +
+  \mathcal{L}_{\mathrm{L2}}.
+\end{equation}
+
+\subsection{Rollout State Loss}
+
+The rollout loss compares predicted future states against ground truth:
+\begin{align}
+  \mathcal{L}_{\mathrm{rollout}}
+  &=
+  w_q
+  \left\|
+    \hat{q} - q
+  \right\|_2^2
+  +
+  w_{\dot{q}}
+  \left\|
+    \hat{\dot{q}} - \dot{q}
+  \right\|_2^2
+  +
+  w_p
+  \left\|
+    \hat{p}^o - p^o
+  \right\|_2^2 \nonumber \\
+  &\quad+
+  w_r
+  d_r(\hat{r}^o,r^o)
+  +
+  w_v
+  \left\|
+    \hat{v}^o - v^o
+  \right\|_2^2
+  +
+  w_{\omega}
+  \left\|
+    \hat{\omega}^o - \omega^o
+  \right\|_2^2.
+\end{align}
+
+The quaternion loss uses the sign-invariant distance:
+\begin{equation}
+  d_r(\hat{r},r)
+  =
+  \min
+  \left(
+    \left\|\hat{r} - r\right\|_2^2,
+    \left\|\hat{r} + r\right\|_2^2
+  \right),
+\end{equation}
+because \(r\) and \(-r\) represent the same orientation.
+
+The default rollout weights are:
+\begin{align}
+  w_q &= 1.0, &
+  w_{\dot{q}} &= 0.2, &
+  w_p &= 5.0, \\
+  w_r &= 0.5, &
+  w_v &= 1.0, &
+  w_{\omega} &= 0.5.
+\end{align}
+
+\subsection{Robot GT Dynamics Loss}
+
+The robot dynamics loss supervises the same structured robot terms as the
+robot-only version, plus the residual torque:
+\begin{align}
+  \mathcal{L}_{\mathrm{robotGT}}
+  &=
+  \lambda_M
+  \left\|
+    \hat{H} - M_{\mathrm{GT}}
+  \right\|_2^2
+  +
+  \lambda_I
+  \left\|
+    \widehat{H\ddot{q}} - (M\ddot{q})_{\mathrm{GT}}
+  \right\|_2^2 \nonumber \\
+  &\quad+
+  \lambda_C
+  \left\|
+    \hat{c} - c_{\mathrm{GT}}
+  \right\|_2^2
+  +
+  \lambda_g
+  \left\|
+    \hat{g} - g_{\mathrm{GT}}
+  \right\|_2^2 \nonumber \\
+  &\quad+
+  \lambda_{\ddot{q}}
+  \left\|
+    \hat{\ddot{q}} - \ddot{q}_{\mathrm{GT}}
+  \right\|_2^2
+  +
+  \lambda_{\mathrm{ID}}
+  \left\|
+    \hat{\tau}_{\mathrm{ID}} - \tau_{\mathrm{ID,GT}}
+  \right\|_2^2 \nonumber \\
+  &\quad+
+  \lambda_{\mathrm{res}}
+  \left\|
+    \hat{\tau}_{\mathrm{res}} -
+    \left(
+      \tau_{\mathrm{ID,GT}} - \tau
+    \right)
+  \right\|_2^2.
+\end{align}
+
+The default robot dynamics weights are:
+\begin{align}
+  \lambda_M &= 0.01, &
+  \lambda_I &= 0.01, &
+  \lambda_C &= 0.01, \\
+  \lambda_g &= 0.01, &
+  \lambda_{\ddot{q}} &= 0.0, &
+  \lambda_{\mathrm{ID}} &= 0.0, \\
+  \lambda_{\mathrm{res}} &= 0.01.
+\end{align}
+
+\subsection{Object Dynamics Loss}
+
+The object dynamics loss supervises predicted linear acceleration, angular
+acceleration, and external force:
+\begin{align}
+  \mathcal{L}_{\mathrm{objectGT}}
+  &=
+  \lambda_{\dot{v}}
+  \left\|
+    \hat{\dot{v}}^o - \dot{v}^o_{\mathrm{GT}}
+  \right\|_2^2
+  +
+  \lambda_{\dot{\omega}}
+  \left\|
+    \hat{\dot{\omega}}^o - \dot{\omega}^o_{\mathrm{GT}}
+  \right\|_2^2 \nonumber \\
+  &\quad+
+  \lambda_F
+  \left\|
+    \hat{F}_{\mathrm{ext}} -
+    F_{\mathrm{ext,GT}}
+  \right\|_2^2.
+\end{align}
+
+The default object dynamics weights are:
+\begin{align}
+  \lambda_{\dot{v}} &= 0.01, \\
+  \lambda_{\dot{\omega}} &= 0.001, \\
+  \lambda_F &= 0.01.
+\end{align}
+
+\subsection{Regularization}
+
+Two auxiliary regularizers are available:
+\begin{equation}
+  \mathcal{L}_{\mathrm{reg}}
+  =
+  \lambda_{\mathrm{cor}}
+  \left\|
+    \hat{c}
+  \right\|_2^2
+  +
+  \lambda_{\tau}
+  \left\|
+    \hat{\tau}_{\mathrm{res}}
+  \right\|_2^2.
+\end{equation}
+The default values are:
+\begin{align}
+  \lambda_{\mathrm{cor}} &= 0.0, \\
+  \lambda_{\tau} &= 10^{-5}.
+\end{align}
+
+The trainer also applies an explicit L2 penalty to trainable weight matrices:
+\begin{equation}
+  \mathcal{L}_{\mathrm{L2}}
+  =
+  \lambda_{\mathrm{W}}
+  \sum_i
+  \|W_i\|_2^2,
+\end{equation}
+with default
+\begin{equation}
+  \lambda_{\mathrm{W}} = 10^{-6}.
+\end{equation}
+
+\section{Training Procedure}
+
+Training uses AdamW:
+\begin{align}
+  \text{learning rate} &= 10^{-5}, \\
+  \text{weight decay} &= 10^{-6}, \\
+  \text{batch size} &= 256.
+\end{align}
+The default rollout horizon is
+\begin{equation}
+  H = 3,
+\end{equation}
+and the default history length is
+\begin{equation}
+  K_h = 5.
+\end{equation}
+
+The dataset is split by episode:
+\begin{equation}
+  90\% \text{ training episodes}, \qquad
+  10\% \text{ validation episodes}.
+\end{equation}
+For each epoch, the model is trained on mini-batches of rollout windows. The
+validation loss is computed without optimizer updates. The trainer saves:
+\begin{lstlisting}
+best.pt
+last.pt
+\end{lstlisting}
+where \texttt{best.pt} is selected using the lowest validation total loss.
+
+Gradient clipping is applied:
+\begin{equation}
+  \|\nabla_\theta \mathcal{L}\|_2 \leq 10.
+\end{equation}
+
+\section{Logged Metrics}
+
+The training loop logs the following major quantities to TensorBoard:
+\begin{lstlisting}
+loss
+rollout_loss
+robot_dyn_loss
+object_dyn_loss
+reg_loss
+weight_l2_loss
+q_mse
+dq_mse
+object_pos_mse
+object_quat_mse
+object_lin_vel_mse
+object_ang_vel_mse
+one_step_q_mse
+one_step_object_pos_mse
+final_step_q_mse
+final_step_object_pos_mse
+mass_matrix_mse
+inertial_mse
+coriolis_gt_mse
+gravity_mse
+qdd_mse
+inverse_dynamics_mse
+residual_torque_mse
+object_lin_acc_mse
+object_ang_acc_mse
+object_external_force_mse
+coriolis_reg
+residual_torque_reg
+torque_abs_mean
+residual_torque_abs_mean
+\end{lstlisting}
+
+\section{Example Commands}
+
+Training with the default hybrid loss:
+\begin{lstlisting}[language=bash]
+python wm_train.py \
+  --dataset_file ../../../../reinforcement_learning/skrl/datasets/Lift_RL_opt_robot_object_dynamics_10000ep.hdf5 \
+  --rollout_horizon 3 \
+  --train_batch_fraction 0.1
+\end{lstlisting}
+
+Training with stronger object acceleration supervision:
+\begin{lstlisting}[language=bash]
+python wm_train.py \
+  --dataset_file ../../../../reinforcement_learning/skrl/datasets/Lift_RL_opt_robot_object_dynamics_10000ep.hdf5 \
+  --lambda_object_lin_acc 0.05 \
+  --lambda_object_ang_acc 0.005 \
+  --lambda_object_external_force 0.05
+\end{lstlisting}
+
+Plotting robot gripper and object trajectories:
+\begin{lstlisting}[language=bash]
+python plot_robot_object_trajectory.py \
+  --checkpoint ./outputs_robot_object_gt_dynamics/run_YYYYMMDD_HHMMSS/best.pt \
+  --dataset_file ../../../../reinforcement_learning/skrl/datasets/Lift_RL_opt_robot_object_dynamics_10000ep.hdf5 \
+  --episode_index 0 \
+  --rollout_steps 100
+\end{lstlisting}
+
+Plotting robot/object dynamics terms:
+\begin{lstlisting}[language=bash]
+python plot_gt_vs_predicted_dynamics_terms.py \
+  --checkpoint ./outputs_robot_object_gt_dynamics/run_YYYYMMDD_HHMMSS/best.pt \
+  --dataset_file ../../../../reinforcement_learning/skrl/datasets/Lift_RL_opt_robot_object_dynamics_10000ep.hdf5 \
+  --episode_index 0 \
+  --start_t 20 \
+  --rollout_steps 50
+\end{lstlisting}
+
+\section{Important Caveats}
+
+\subsection{Torque Is Still an Input}
+
+The model receives recorded future torque values from the dataset:
+\begin{equation}
+  \hat{\tau}_t = \tau_t.
+\end{equation}
+It does not predict policy actions or actuator torques. The learned residual
+torque is an additional correction used inside the dynamics equation, not a
+replacement for the recorded torque input.
+
+\subsection{Robot Dynamics Labels Are Free-Space Terms}
+
+The labels \(M\), \(c\), and \(g\) come from PhysX robot dynamics queries. They
+are free-space robot model terms. Contact and grasp effects are represented in
+this architecture through the learned residual torque and object dynamics
+supervision, not through a full constrained robot-object mass matrix.
+
+\subsection{Residual Torque Is Not a Direct Force Sensor}
+
+The residual target
+\begin{equation}
+  \tau_{\mathrm{ID,GT}} - \tau
+\end{equation}
+is useful for learning mismatch around contact, but it is not a direct measured
+contact wrench. It can include actuator-model mismatch, numerical effects, and
+differences between recorded torque and inverse-dynamics labels.
+
+\subsection{Object Force Estimate Is Approximate}
+
+The dataset's \texttt{external\_force\_est\_w} is computed from object mass,
+linear acceleration, and gravity:
+\begin{equation}
+  F_{\mathrm{ext}} \approx m_o(\dot{v}^o - g).
+\end{equation}
+It is an estimated non-gravity force in world coordinates. It can reflect
+contact and grasp effects, but it is not a direct contact-force measurement.
+
+\subsection{Open-Loop Instability}
+
+During long open-loop rollout, the model recursively feeds predicted robot and
+object states back into the next dynamics step. Errors can accumulate:
+\begin{equation}
+  \hat{s}_{t+h}
+  \neq
+  s_{t+h}.
+\end{equation}
+If the predicted robot or object state leaves the training distribution,
+structured terms, residual torques, object accelerations, or quaternion
+integration can become inaccurate. The evaluation scripts stop and report the
+failure if non-finite states appear.
+
+\subsection{No Full Coupled DeLaN System}
+
+This model is not a full DeLaN model over robot and object generalized
+coordinates. It does not construct a coupled mass matrix for
+\([q, p^o, r^o]\). Instead, it keeps the robot dynamics structured and learns
+object/contact coupling with supervised residual heads. This is a practical
+choice matched to the available HDF5 labels.
+
+\end{document}

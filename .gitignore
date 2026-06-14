@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Local environments and secrets
+.env
+.venv/
+venv/
+
+# Training outputs and experiment artifacts
+**/outputs*/
+**/wandb/
+**/tensorboard/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.hdf5
+*.h5
+*.npz
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store

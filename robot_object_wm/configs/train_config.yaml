@@ -1,0 +1,94 @@
+# Default TrainConfig for RobotDynamics + ObjDynamics = WMDynamics.
+
+dataset_dir: ../dataset
+dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep.hdf5
+
+# split: robot DeLaN + object MLP
+# whole: one DeLaN over robot + object generalized coordinates
+model_type: whole
+
+history_len: 5
+rollout_horizon: 3
+robot_dof: 9
+action_dim: 8
+torque_dim: 9
+torque_key: applied_torque
+
+hidden_dim: 256
+object_hidden_dim: 256
+object_depth: 3
+tool_z_offset: 0.1034
+dt: 0.02
+ode_solver: rk4  # euler or rk4
+
+batch_size: 256
+epochs: 200
+lr: 1.0e-4
+weight_decay: 1.0e-6
+
+q_weight: 1.0
+dq_weight: 1.
+object_pos_weight: 1.0
+object_quat_weight: 1.
+object_lin_vel_weight: 1.0
+object_ang_vel_weight: 1.
+
+# Latent context encoder and DeLaN FiLM.
+# z = encoder(history_states, history_torques)
+# If delan_use_film is true, z modulates DeLaN H/g/L heads.
+use_context_encoder: true
+latent_dim: 8
+context_encoder_hidden_dim: 256
+context_encoder_depth: 2
+delan_use_film: true
+delan_film_depth: 2
+lambda_context_kl: 1.0e-4
+
+train_split: 0.9
+seed: 42
+num_workers: 4
+output_dir: ../outputs_wm_dynamics
+run_name:
+log_every_batches: 200
+train_batch_fraction: 0.1
+train_subsample_fraction: 0.2
+val_subsample_fraction: 1.0
+
+filter_pre_contact: false
+object_displacement_threshold: 0.005
+object_velocity_threshold: 0.02
+contact_consecutive_steps: 3
+contact_settle_steps: 5
+subtract_env_origin: true
+
+wandb_project_name: world-model
+wandb_entity: tjrcjf410-seoul-national-university
+wandb_name:
+wandb_mode: online
+wandb_artifacts: true
+
+# Post-training evaluation. Artifacts are written under:
+#   <output_dir>/<run_name>/<eval_output_dir>/
+eval_after_train: true
+eval_fail_on_error: false
+eval_output_dir: eval
+eval_split: val
+eval_batch_size:
+eval_max_batches:
+eval_max_episodes:
+eval_num_workers: 0
+
+eval_episode_plot: true
+eval_episode_index: 0
+eval_episode_name:
+eval_start_t: 25
+eval_rollout_steps: 25
+eval_target: gripper
+
+eval_prediction_metrics: true
+eval_pred_horizon: 10
+eval_prediction_max_episodes: 10
+
+eval_video: true
+eval_fps: 25
+eval_max_frames: 250

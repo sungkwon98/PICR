@@ -1,0 +1,425 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{Contact\_Flag\_discrete:\\Robot + Object World Model with a Discrete Contact Flag and Gated Newton--Euler Dynamics}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+The implementation under
+\begin{center}
+\texttt{scripts/world\_model/Physics/Robot\_and\_Object/Contact\_Flag\_discrete}
+\end{center}
+is a fork of \texttt{No\_object\_Euler/} with one structural change:
+the continuous coupling factor $\alpha_t \in [0,1]$ is replaced by a
+\textbf{discrete contact flag}
+\(
+  c_t \in \{0, 1\}.
+\)
+The flag is produced by a small head \texttt{ContactFlagHead} whose
+output is binarised through a \emph{straight-through estimator} (STE)
+so the integrator always sees a literal $0$ or $1$ in the forward
+pass while gradients still flow through a sigmoid in the backward
+pass.
+
+The object integrator is also changed.  Whereas
+\texttt{No\_object\_Euler} computes the next cube twist as a kinematic
+blend
+\(
+  v^o_{t+1} = \alpha_t v_g + (1-\alpha_t) \rho_v v^o_t
+\),
+this folder uses the full \emph{Newton--Euler equations} of motion,
+gated by $c_t$:
+\begin{align}
+  m_o\,\dot v^o_t
+    &= m_o\,g_w \;+\; c_t\,F_c^{\mathrm{lin}}, \\
+  I_w\,\dot \omega^o_t \;+\; \omega^o_t \times I_w\,\omega^o_t
+    &= c_t\,F_c^{\mathrm{ang}}.
+\end{align}
+When $c_t = 0$ the cube is a free body in gravity (linear free fall,
+purely gyroscopic rotation); when $c_t = 1$ we recover the
+Newton--Euler equations of \texttt{MCGDF} verbatim.  The discrete
+flag $c_t$ also gates the robot-side action--reaction torque:
+\begin{equation}
+  \tau_{\mathrm{contact},t} = -c_t\,J_c(q_t)^\top F_c(s_t, \tau_t, z).
+  \label{eq:cfd-robot-coupling}
+\end{equation}
+
+Compared to the four sibling variants, this folder sits exactly
+between \texttt{MCGDF} (full Newton--Euler always) and
+\texttt{No\_object\_Euler} (no Newton--Euler ever).  It keeps the
+physics structure but lets a learned classifier decide \emph{when} to
+apply the contact wrench at all.
+
+\section{State, Input, and Context}
+
+State, input, and per-episode context are identical to the other
+sibling models:
+\begin{equation}
+  s_t \in \mathbb{R}^{31},\quad
+  \tau_t \in \mathbb{R}^{9},\quad
+  \xi = [m_o,\,I_b\,\mathrm{(9)},\,\mu_o\,(3)] \in \mathbb{R}^{13}.
+\end{equation}
+The Newton--Euler integrator on the object side \emph{requires}
+$m_o, I_b$ from $\xi$.  Those values are still loaded from the
+dataset and supplied to \texttt{forward(...)} via the
+\texttt{object\_context} argument.  The \texttt{ContactWrenchHead}'s
+consumption of $\xi$ remains controlled by
+\texttt{omit\_object\_context} (default \texttt{True}, matching
+No-Object-Euler), but the Newton--Euler step always uses the full
+$\xi$ regardless.
+
+\section{The Discrete Contact Flag}
+
+\subsection{Head architecture and inputs}
+
+\texttt{ContactFlagHead} reads the same three quantities as the old
+\texttt{CouplingHead}:
+\begin{equation}
+  \mathrm{logits}_t \;=\; \mathrm{MLP}\bigl(\|F_c^{\mathrm{lin}}\|_2,\;
+  \mathbf{d}_t,\; z\bigr),
+  \qquad
+  \mathbf{d}_t = p_g(q_t) - p^o_t,
+  \label{eq:cfd-logits}
+\end{equation}
+where $p_g(q)$ is the analytic Franka gripper-tip position.  The
+output is a single scalar logit.
+
+\subsection{Straight-through binarisation}
+
+The discrete flag is obtained from the logit by a
+straight-through estimator (function \texttt{\_ste\_binary}):
+\begin{equation}
+  c_t
+  \;=\;
+  \mathbf{1}\bigl(\mathrm{logits}_t > 0\bigr)
+  \;\in\;
+  \{0, 1\}
+  \quad\text{(forward)},
+  \qquad
+  \frac{\partial c_t}{\partial \mathrm{logits}_t}
+  \;=\;
+  \sigma'(\mathrm{logits}_t)
+  \quad\text{(backward)}.
+  \label{eq:cfd-ste}
+\end{equation}
+In code,
+\begin{lstlisting}
+prob = sigmoid(logits)
+hard = (logits > 0).float()
+c    = hard - prob.detach() + prob   # value = hard, gradient = sigmoid
+\end{lstlisting}
+This is the standard trick from Bengio et al.\ (2013): the integrator
+sees an honest 0 or 1, but the rollout MSE can still shape the head
+through a sigmoid gradient as if no threshold were present.
+
+\subsection{Diagnostic outputs}
+
+The companion aux dict reports
+\begin{itemize}
+  \item \texttt{contact\_flag}: $c_t \in \{0, 1\}$, the binarised flag.
+  \item \texttt{contact\_flag\_prob}: $p_t = \sigma(\mathrm{logits}_t)$,
+    the underlying soft probability.  Useful for monitoring (does the
+    head live near $0.5$, meaning it is uncertain?) and for auxiliary
+    BCE supervision if a heuristic contact label is provided.
+  \item \texttt{contact\_flag\_logits}: the raw pre-sigmoid logits.
+\end{itemize}
+For backward compatibility with downstream tooling that already reads
+\texttt{aux["alpha"]} (animation signal panel, error-plot helpers),
+the key \texttt{"alpha"} is aliased to \texttt{contact\_flag} -- the
+values are now $\{0, 1\}$ rather than continuous in $[0, 1]$.
+
+\section{Forward Dynamics: Newton--Euler Gated by $c_t$}
+
+\subsection{Robot side}
+
+The robot side keeps the structure of MCGDF, with the
+action--reaction torque gated by the flag
+(Eq.~\eqref{eq:cfd-robot-coupling}):
+\begin{equation}
+  H(q,z)\,\ddot q
+  \;=\;
+  \tau + r_\theta(q,\dot q, \tau, z)
+  - c(q,\dot q,z) - g(q,z)
+  - d\dot q - f\tanh(\dot q/\varepsilon_f)
+  + \underbrace{(-c_t\,J_c^\top F_c)}_{\tau_{\mathrm{contact}}}.
+  \label{eq:cfd-robot}
+\end{equation}
+When $c_t = 0$, $\tau_{\mathrm{contact}} = 0$: the robot evolves as
+if the cube did not exist.  When $c_t = 1$, we recover the standard
+MCGDF Newton's-third-law coupling exactly.  The contact wrench $F_c$
+is still predicted by the same \texttt{ContactWrenchHead} as in
+MCGDF; it is meaningful only on the $c_t = 1$ subset of frames but
+can in principle take any value on $c_t = 0$ frames (those values get
+gated to zero on both sides).  An L2 regularizer on $\|F_c\|$ is
+therefore recommended to keep $F_c$ well-behaved on no-contact
+frames.
+
+Robot kinematic integration is unchanged from MCGDF:
+\begin{equation}
+  \dot q_{t+1} = \dot q_t + \ddot q_t\,\Delta t,
+  \qquad
+  q_{t+1} = q_t + \dot q_{t+1}\,\Delta t.
+\end{equation}
+
+\subsection{Object side: gated Newton--Euler}
+
+Inertia is computed exactly as in MCGDF, from $\xi$:
+\begin{equation}
+  I_w(r^o_t)
+  \;=\; R(r^o_t)\,I_b\,R(r^o_t)^\top,
+\end{equation}
+symmetrised before use.  Linear and angular accelerations follow
+Newton--Euler, gated by the discrete flag:
+\begin{align}
+  \dot v^o_t
+    &= g_w \;+\; c_t\,\frac{F_c^{\mathrm{lin}}}{m_o},
+    \label{eq:cfd-vobjdot}\\
+  I_w\,\dot \omega^o_t
+    &= c_t\,F_c^{\mathrm{ang}} \;-\; \omega^o_t \times I_w\,\omega^o_t,
+    \label{eq:cfd-wobjdot}
+\end{align}
+where $g_w = (0, 0, -9.81)$.  Eq.~\eqref{eq:cfd-wobjdot} is solved
+for $\dot \omega^o_t$ by inverting $I_w + 10^{-6}\mathbb{I}$ as in
+MCGDF.
+
+\paragraph{Physical interpretation of the two regimes.}
+\begin{itemize}
+  \item $c_t = 0$ (\emph{no contact}): the cube is a free body in
+    gravity.  Eq.~\eqref{eq:cfd-vobjdot} reduces to linear free fall
+    $\dot v^o = g_w$; Eq.~\eqref{eq:cfd-wobjdot} reduces to the
+    purely gyroscopic
+    $I_w \dot \omega^o = -\omega^o \times I_w \omega^o$, which is
+    rigid-body precession at constant kinetic energy.
+  \item $c_t = 1$ (\emph{in contact}): identical to the MCGDF
+    Newton--Euler integrator -- the contact wrench $F_c$ enters with
+    full strength on both equations.
+\end{itemize}
+
+\subsection{Integration}
+
+Object integration follows the MCGDF semi-implicit Euler + closed-form
+quaternion exponential map:
+\begin{align}
+  v^o_{t+1}      &= v^o_t      + \dot v^o_t\,\Delta t, \\
+  \omega^o_{t+1} &= \omega^o_t + \dot \omega^o_t\,\Delta t, \\
+  p^o_{t+1}      &= p^o_t      + v^o_{t+1}\,\Delta t, \\
+  r^o_{t+1}      &= r^o_t \otimes \exp\!\bigl(\tfrac{1}{2}\omega^o_{t+1}\,\Delta t\bigr).
+\end{align}
+
+\section{What is and is Not Learned}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.30\linewidth} p{0.30\linewidth} p{0.18\linewidth} p{0.10\linewidth}}
+\toprule
+Sub-network (class)              & Input                                  & Output                       & Hidden \\
+\midrule
+\texttt{g\_net} (MLP)            & $q \in \mathbb{R}^9$                  & $g \in \mathbb{R}^9$         & 256    \\
+\texttt{l\_diag\_net} (Deriv.\,MLP) & $q \in \mathbb{R}^9$              & $\ell_d \in \mathbb{R}^9$    & 256    \\
+\texttt{l\_offdiag\_net} (Deriv.\,MLP) & $q \in \mathbb{R}^9$           & $\ell_o \in \mathbb{R}^{36}$ & 256    \\
+\texttt{ResidualTorqueHead}      & $(q,\dot q,\tau) \in \mathbb{R}^{27}$ & $r_\theta \in \mathbb{R}^9$  & 128    \\
+\texttt{ContactWrenchHead}       & $(s,\tau,\xi?) \in \mathbb{R}^{40\text{ or }53}$ & $F_c \in \mathbb{R}^6$ & 128    \\
+\texttt{ContactFlagHead}         & $(\|F_c^{\mathrm{lin}}\|, \mathbf{d}_t, z) \in \mathbb{R}^{4+\mathrm{ld}}$ & logit $\to c_t \in \{0, 1\}$ & 64 \\
+\texttt{ContextEncoder} (VAE)    & flat history of $(s,\tau)$ over $K$ steps & $(\mu,\log\sigma^2) \in \mathbb{R}^{2\,\mathrm{ld}}$ & 256 \\
+\texttt{LatentInnovationUpdate}  & $(z_{t-1}, e_t, F_c^{t-1})$           & $z_t \in \mathbb{R}^{\mathrm{ld}}$ & 64 \\
+\texttt{JointDampingFrictionParams} (opt.) & ---                         & $9+9$ scalars                & ---    \\
+\bottomrule
+\end{tabular}
+\caption{Trainable sub-networks of the
+Contact\_Flag\_discrete variant.  The new row is
+\texttt{ContactFlagHead}; \texttt{CouplingHead} and the passive
+decays $\rho_v, \rho_\omega$ are removed.  ld $=$ \texttt{latent\_dim}.}
+\label{tab:cfd-subnets}
+\end{table}
+
+\paragraph{What is \emph{not} learned (object side).}
+\begin{itemize}
+  \item Newton's second law and the gyroscopic Euler equation
+    (Eqs.~\eqref{eq:cfd-vobjdot}--\eqref{eq:cfd-wobjdot}).
+  \item World-frame inertia construction
+    $I_w = R\,I_b\,R^\top$.
+  \item Semi-implicit Euler position update + quaternion exp-map.
+\end{itemize}
+All of these are written out in the integrator and use the dataset's
+$m_o$ and $I_b$ directly.
+
+\section{Trajectory Prediction}
+
+A rollout over horizon $H$ is produced by the same recursion as
+MCGDF:
+\begin{equation}
+  s_{t+h+1} \;=\; \mathrm{RobotObjectMCGDFStep}\bigl(s_{t+h},\,\tau_{t+h+1},\,\xi,\,z\bigr),
+  \qquad h = 0, 1, \dots, H-1,
+\end{equation}
+with the same optional closed-loop filter window from
+\texttt{No\_object\_Euler} (controlled by \texttt{--filter\_steps}).
+At step $h$ the model:
+\begin{enumerate}
+  \item predicts $F_c$ from \texttt{ContactWrenchHead};
+  \item predicts $c_{t+h} \in \{0, 1\}$ from \texttt{ContactFlagHead}
+    (Eqs.~\eqref{eq:cfd-logits}--\eqref{eq:cfd-ste});
+  \item applies $-c_{t+h} J_c^\top F_c$ on the robot side and
+    $c_{t+h} F_c$ on the object side
+    (Eqs.~\eqref{eq:cfd-vobjdot}--\eqref{eq:cfd-wobjdot});
+  \item integrates the resulting accelerations by semi-implicit
+    Euler + quaternion exp-map.
+\end{enumerate}
+
+\section{Training and Auxiliary Losses}
+
+No structural change to the loss menu is required.  All existing
+losses from \texttt{No\_object\_Euler} (rollout MSE, robot supervision,
+object-acceleration supervision, residual head supervision, KL on
+$z_0$, InfoNCE, contact-wrench L2) continue to compute and produce a
+signal because the aux dict still emits \texttt{object\_lin\_acc} and
+\texttt{object\_ang\_acc} -- now they are \emph{genuine}
+Newton--Euler accelerations
+(Eqs.~\eqref{eq:cfd-vobjdot}--\eqref{eq:cfd-wobjdot}) rather than the
+finite-difference proxies used in
+\texttt{No\_object\_Euler}.  In particular
+\texttt{supervised\_object\_dynamics\_loss}'s MSE against the recorded
+$\dot v^o / \dot \omega^o$ is now an exact constraint on the
+contact-wrench head's predictions on $c_t = 1$ frames (and on the
+gyroscopic term on $c_t = 0$ frames).
+
+\paragraph{Two practical loss-design notes.}
+\begin{itemize}
+  \item \emph{Direct contact-flag supervision.}  The dataset
+    affords a simple heuristic contact label
+    $\hat c_t = \mathbf{1}\bigl(\|p_g(q_t) - p^o_t\| < d_{\mathrm{thr}}
+    \;\wedge\; \|v_g - v^o\| < v_{\mathrm{thr}}\bigr)$, computable from
+    purely-recorded quantities.  Adding a binary cross-entropy term
+    \(
+      \mathcal{L}_{\mathrm{flag}}
+      = \lambda_{\mathrm{flag}} \, \mathrm{BCE}(p_t, \hat c_t)
+    \)
+    breaks the asymmetric-gradient trap documented in the No-Object-Euler
+    notes (the pre-contact regime would otherwise drag the head
+    toward $c_t = 0$ globally).
+  \item \emph{Initial bias.}  Initialising the
+    \texttt{ContactFlagHead}'s last-layer bias to a small positive
+    value (e.g.\ $+1.0$ so $p_0 \approx 0.73$) makes the flag start
+    on-rather-than-off, which we found pairs well with the L2
+    regularizer pulling $F_c$ toward zero (no premature collapse).
+\end{itemize}
+
+\section{Comparison with the Sibling Models}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.20\linewidth} p{0.34\linewidth} p{0.20\linewidth} p{0.16\linewidth}}
+\toprule
+Model & Object-side equation & Learned signal driving the object & Physical prior \\
+\midrule
+\textbf{MCGDF} & Newton--Euler:
+\(m_o \dot v^o = m_o g + F_c^{\mathrm{lin}}\),
+\(I_w \dot\omega^o + \omega \!\times\! I_w \omega = F_c^{\mathrm{ang}}\)
+& Contact wrench $F_c \in \mathbb{R}^6$
+& Strong: $F=ma$, gyroscopic Euler, world-frame inertia, always applied \\
+\textbf{No-Object-Euler} & Kinematic blend:
+\(v^o_{t+1} = \alpha_t v_g + (1-\alpha_t)\rho_v v^o_t\)
+& Coupling factor $\alpha_t \in [0,1]$ + decays
+& Medium: carry vs.\ release dichotomy, no $F=ma$ \\
+\textbf{Context DeLaN} & Acceleration head:
+\((\dot v^o, \dot\omega^o) = \mathrm{MLP}(s,\tau,z)\)
+& The 6-D acceleration vector
+& Low: integrators preserve kinematic identities, no $F=ma$ \\
+\textbf{Contact\_Flag\_discrete} (this) & Newton--Euler \emph{gated} by $c_t \in \{0,1\}$
+(Eqs.~\eqref{eq:cfd-vobjdot}--\eqref{eq:cfd-wobjdot})
+& Discrete flag $c_t$ + contact wrench $F_c$
+& Strong on $c_t = 1$, free-body on $c_t = 0$.
+  Discrete mode switching. \\
+\bottomrule
+\end{tabular}
+\caption{Object-side comparison across the four sibling models.  This
+variant is unique in mixing a hard mode-switch (discrete $c_t$) with
+full Newton--Euler physics inside each mode.}
+\label{tab:cfd-vs-others}
+\end{table}
+
+\section{Caveats}
+
+\begin{itemize}
+  \item \emph{No-contact $F_c$ is unconstrained by the integrator.}
+    On $c_t = 0$ frames neither side uses $F_c$.  The
+    \texttt{ContactWrenchHead}'s output on those frames is therefore
+    underdetermined; L2 regularization on $\|F_c\|^2$ keeps it small
+    and prevents pathological behaviour at the boundary.
+  \item \emph{STE is biased.}  The gradient through
+    Eq.~\eqref{eq:cfd-ste} is the gradient of the sigmoid surrogate,
+    not the gradient of the indicator.  Training is therefore biased
+    in the standard STE sense; in practice this is harmless for the
+    Lift task but can produce slow convergence near the decision
+    boundary.
+  \item \emph{Discontinuous trajectories at mode switches.}  When the
+    flag flips $0 \to 1$ between frames, the predicted cube
+    acceleration jumps discontinuously by $F_c / m_o$ (linear) and
+    $I_w^{-1} F_c^{\mathrm{ang}}$ (angular).  This is what the
+    underlying physics actually does (impact discontinuities), but it
+    can produce visible jitter in long rollouts if the flag head is
+    noisy.  A small EMA on the prob is an easy mitigation if needed.
+  \item \emph{Object Newton--Euler still requires $\xi$.}  Unlike
+    \texttt{No\_object\_Euler}, this folder cannot be made entirely
+    GT-$\xi$-free at evaluation time without first putting a
+    regression head $\hat\xi(z)$ on the cube mass and inertia.  The
+    \texttt{omit\_object\_context} flag only controls the
+    \texttt{ContactWrenchHead}'s consumption of $\xi$; the integrator
+    still reads $m_o$ and $I_b$ from \texttt{object\_context}.
+\end{itemize}
+
+\section{Implementation Pointers}
+
+\paragraph{File layout.}
+\begin{itemize}
+  \item \texttt{models.py} -- new \texttt{ContactFlagHead} class +
+    \texttt{\_ste\_binary} helper; \texttt{CouplingHead} and the
+    passive decays $\rho_v, \rho_\omega$ are removed; the per-step
+    forward now applies the gating
+    Eqs.~\eqref{eq:cfd-vobjdot}--\eqref{eq:cfd-wobjdot}.
+  \item \texttt{wm\_train.py} -- new CLI flags
+    \texttt{--contact\_flag\_hidden\_dim},
+    \texttt{--contact\_flag\_depth} (replacing the old
+    \texttt{--coupling\_*} flags); \texttt{--init\_rho\_v} and
+    \texttt{--init\_rho\_omega} are removed.
+  \item \texttt{plot\_multistep\_trajectory.py},
+    \texttt{animate\_episode.py},
+    \texttt{plot\_pred\_error\_heavy\_light.py} -- updated checkpoint
+    loaders for the new constructor args; the aux key
+    \texttt{"alpha"} is aliased to \texttt{"contact\_flag"} so the
+    existing signal panel and per-frame error plots work without
+    further edits.
+\end{itemize}
+
+\paragraph{New constructor flags
+(\texttt{MultiStepRobotObjectMCGDFWorldModel}).}
+\begin{itemize}
+  \item \texttt{contact\_flag\_hidden\_dim} (default $64$): hidden
+    width of the \texttt{ContactFlagHead} MLP.
+  \item \texttt{contact\_flag\_depth} (default $2$): number of hidden
+    layers in \texttt{ContactFlagHead}.
+\end{itemize}
+All other constructor args are inherited unchanged from
+\texttt{No\_object\_Euler}.
+
+\end{document}

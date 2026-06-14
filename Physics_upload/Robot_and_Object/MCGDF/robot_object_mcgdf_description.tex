@@ -1,0 +1,905 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{Robot + Object MCGDF World Model:\\Structured Contact via Newton's Third Law and Newton--Euler Object Dynamics}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+The implementation under
+\begin{center}
+\texttt{scripts/world\_model/Physics/Robot\_and\_Object/MCGDF}
+\end{center}
+extends the robot-only MCGDF model with a structured robot--object coupling.
+It addresses the mismatches identified in Section~4.3 of the verification
+report
+\texttt{scripts/world\_model/Physics/delan\_vs\_physx\_verification.tex},
+in particular the structural items \#1 (no action--reaction coupling), \#5
+(no gyroscopic object structure), \#6 (body-frame inertia in world-frame
+dynamics), \#7 (linearly dependent object linear-acceleration targets),
+\#9 (env-frame object position), and Approach~A of \#2 (decompose the
+residual target).
+
+\section{State, Input, and Context}
+
+The state is
+\begin{equation}
+  s_t =
+  \begin{bmatrix}
+    q_t \\ \dot q_t \\ p^o_t \\ r^o_t \\ v^o_t \\ \omega^o_t
+  \end{bmatrix} \in \mathbb{R}^{18 + 13} = \mathbb{R}^{31},
+\end{equation}
+the input is the recorded torque $\tau_t \in \mathbb{R}^9$, and the
+per-episode physical context is
+\begin{equation}
+  \xi = \bigl[\,m_o,\ I_b\,\mathrm{(9 entries)},\ \mu_o\,(3)\,\bigr] \in \mathbb{R}^{13}.
+\end{equation}
+$I_b$ is the cube inertia in its body frame.
+
+\section{Forward Dynamics}
+
+\subsection{Robot side}
+\begin{equation}
+  H(q)\,\ddot q
+  = \tau + r_\theta(q,\dot q,\tau)
+  - c(q,\dot q) - g(q)
+  - d\dot q - f\tanh(\dot q/\varepsilon_f)
+  - J_c(q)^\top F_c(s,\tau,\xi),
+  \label{eq:mcgdf-robot-coupled}
+\end{equation}
+where $J_c \in \mathbb{R}^{6\times n}$ is the analytic geometric Jacobian of
+the Franka gripper, evaluated at $q$ (last $n-7$ columns are zero), and
+$F_c \in \mathbb{R}^6$ is the learned contact wrench (linear + angular) on
+the cube in world frame. The robot-side contact torque
+$-J_c(q)^\top F_c$ enforces Newton's third law structurally.
+
+Damping is omitted from the RHS by default (\texttt{--omit\_damping}) for
+the same reason as in the robot-only MCGDF: under Franka's implicit-actuator
+configuration, the recorded \texttt{applied\_torque} already contains the
+implicit-PD damping torque.
+
+\subsection{Object side}
+\begin{align}
+  m_o\,\dot v^o
+  &= m_o\, g_w + F_c^{\mathrm{lin}},
+  \label{eq:mcgdf-object-linear}\\
+  I_w(r^o)\,\dot\omega^o + \omega^o\times\bigl(I_w(r^o)\,\omega^o\bigr)
+  &= F_c^{\mathrm{ang}},
+  \label{eq:mcgdf-object-angular}\\
+  I_w(r^o) &= R(r^o)\,I_b\,R(r^o)^\top.
+  \label{eq:mcgdf-Iw}
+\end{align}
+The world-frame inertia $I_w$ is constructed every step from the
+predicted/recorded quaternion and the body-frame inertia tensor stored in
+$\xi$, fixing mismatch~\#6. The gyroscopic term $\omega^o\times(I_w\omega^o)$
+is part of the equation rather than learned (mismatch~\#5).
+
+\subsection{Quaternion integration}
+The object orientation is integrated by the closed-form exponential map
+\begin{equation}
+  r^o_{t+1} = r^o_t \otimes
+  \exp\!\bigl(\tfrac{1}{2}\,\omega^o_{t+1}\,\Delta t\bigr),
+  \quad
+  \exp\!\bigl([0,\mathbf{v}]\bigr) = \bigl(\cos\|\mathbf{v}\|,\,\tfrac{\sin\|\mathbf{v}\|}{\|\mathbf{v}\|}\mathbf{v}\bigr),
+  \label{eq:mcgdf-quat-exp}
+\end{equation}
+replacing the linear-Euler step used in the GT-dynamics variant
+(mismatch~\#4).  Position and velocities use semi-implicit Euler.
+
+\section{Neural Network Architecture}
+\label{sec:architecture}
+
+The model contains five focused sub-networks plus optional 18 scalar
+parameters when joint damping/friction are made learnable. Everything else
+in the forward pass (forward kinematics, Newton--Euler object dynamics,
+quaternion integration, semi-implicit Euler) is analytic.
+
+\subsection{Sub-network inventory}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.27\linewidth} p{0.22\linewidth} p{0.18\linewidth} p{0.11\linewidth} p{0.16\linewidth}}
+\toprule
+Sub-network (class)              & Input                                  & Output                       & Depth & Hidden \\
+\midrule
+\texttt{g\_net} (MLP)            & $q \in \mathbb{R}^9$                  & $g \in \mathbb{R}^9$         & 2     & 256    \\
+\texttt{l\_diag\_net} (Deriv.\,MLP) & $q \in \mathbb{R}^9$              & $\ell_d \in \mathbb{R}^9$    & 2     & 256    \\
+\texttt{l\_offdiag\_net} (Deriv.\,MLP) & $q \in \mathbb{R}^9$           & $\ell_o \in \mathbb{R}^{36}$ & 2     & 256    \\
+\texttt{ResidualTorqueHead}      & $(q,\dot q,\tau) \in \mathbb{R}^{27}$ & $r_\theta \in \mathbb{R}^9$  & 2     & 128    \\
+\texttt{ContactWrenchHead}       & $(s,\tau,\xi) \in \mathbb{R}^{53}$    & $F_c \in \mathbb{R}^6$       & 3     & 128    \\
+\texttt{JointDampingFrictionParams} & ---                                & 9+9 scalars (softplus, opt.) & --- & ---    \\
+\bottomrule
+\end{tabular}
+\caption{Trainable sub-networks of the robot+object MCGDF model.
+``Depth'' is the number of hidden layers, so each row has $d+1$ linear
+layers separated by SiLU activations. All sizes are exposed as CLI flags.}
+\label{tab:subnets}
+\end{table}
+
+\subsection{What each sub-network produces}
+
+\paragraph{(1) DeLaN structured terms.}
+The robot inertia matrix $H(q)$ is not a direct MLP output. The two
+inertia heads produce a Cholesky-style lower-triangular factor $L(q)$:
+\texttt{l\_diag\_net} outputs 9 raw values passed through
+$\mathrm{softplus}(\cdot)+\varepsilon_d$ to guarantee a positive diagonal,
+\texttt{l\_offdiag\_net} outputs 36 raw values that fill the strict
+lower-triangular entries. Both heads are \texttt{DerivativeMLP}s that
+analytically propagate $\partial L/\partial q$ through the SiLU+Linear
+chain without invoking autograd. The structural inertia and Coriolis terms
+are then
+\begin{equation}
+  H(q) = L(q)L(q)^\top + \varepsilon I,
+  \qquad
+  c(q,\dot q) = \dot H \dot q - \tfrac{1}{2}\nabla_q\bigl(\dot q^\top H \dot q\bigr),
+\end{equation}
+with $c$ derived analytically from $L$, $\partial L/\partial q$, and
+$\dot q$ (the DeLaN identity). The gravity vector is the direct output of
+\texttt{g\_net(q)}.
+
+\paragraph{(2) Residual torque head.}
+\texttt{ResidualTorqueHead} is a small 2-layer MLP
+\(r_\theta(q,\dot q,\tau) \in \mathbb{R}^9\)
+that absorbs the implicit-PD bias and finite-difference / numerical residual
+identified in the verification report.  Crucially the recorded torque
+$\tau$ is included as a network input, because $\tau$ encodes the PD targets
+that drove the implicit actuator.
+
+\paragraph{(3) Contact wrench head.}
+\texttt{ContactWrenchHead} is a 3-layer MLP
+\begin{equation}
+  F_c(s,\tau,\xi)
+  \;=\;\bigl(F_c^{\mathrm{lin}},\ F_c^{\mathrm{ang}}\bigr) \in \mathbb{R}^{3}\!\oplus\mathbb{R}^{3}.
+\end{equation}
+Made deeper than $r_\theta$ because the dependence of the contact force on
+gripper pose, cube state and material properties is more nonlinear than the
+per-joint actuator bias.
+
+\paragraph{(4) Joint damping/friction parameters.}
+\texttt{JointDampingFrictionParams} holds at most $9 + 9$ trainable
+scalars, parameterised as \texttt{softplus(raw)} so they stay non-negative.
+Active only when \texttt{--learn\_damping\_friction} is passed; by default
+the model reads $d$ and $f$ from the dataset.
+
+\subsection{What is \emph{not} learned}
+
+\begin{itemize}
+  \item \textbf{Franka FK and Jacobian.} \texttt{FrankaForwardKinematics}
+    encodes the seven-link kinematic chain as fixed
+    \texttt{register\_buffer}s. It produces $p_{\mathrm{ee}}, R_{\mathrm{ee}},
+    J_c \in \mathbb{R}^{6\times 9}$ as differentiable functions of $q$, with
+    zero learnable parameters.
+  \item \textbf{Newton--Euler object dynamics.}
+    Eqs.~\eqref{eq:mcgdf-object-linear}--\eqref{eq:mcgdf-object-angular} are
+    written out directly. The world-frame inertia
+    $I_w = R(r^o)\,I_b\,R(r^o)^\top$ is rebuilt every step from the predicted
+    quaternion and the body-frame inertia in $\xi$.
+  \item \textbf{Quaternion exponential map.} Eq.~\eqref{eq:mcgdf-quat-exp}.
+  \item \textbf{Semi-implicit Euler integration} for
+    $q, \dot q, p^o, v^o, \omega^o$.
+\end{itemize}
+
+The learned content of the model is therefore restricted to the
+free-space rigid-body terms ($H, c, g$), the implicit-actuator bias
+$r_\theta$, and the contact wrench $F_c$. Everything coupling these
+quantities into a trajectory is the equations of motion expressed in
+PyTorch.
+
+\subsection{End-to-end data flow per step}
+
+\begin{lstlisting}
+state s = [q (9), qdot (9), p_o (3), r_o (4 quat), v_o (3), omega_o (3)]   = 31
+input  tau (9)
+ctx    xi = [m_o (1), I_b (9 flat), mu_o (3)]                              = 13
+
+Structural rigid-body:                              (DeLaN)
+  g_net(q)         -> g (9)
+  l_diag_net(q)    -> ell_d (9)
+  l_offdiag_net(q) -> ell_o (36)
+  -> assemble L (9x9), then H = L L^T + eps I
+  -> coriolis c(q,qdot) analytic from L, dL/dq, qdot
+
+Implicit-PD bias:                                   (Residual head)
+  r_theta(q, qdot, tau) -> 9
+
+Forward kinematics:                                 (analytic, fixed)
+  FK(q) -> p_ee (3), R_ee (3x3)
+  geometric Jacobian J_c (6 x 9), last 2 cols zero
+
+Contact wrench:                                     (Contact head)
+  F_c(s, tau, xi) -> F_lin (3), F_ang (3)
+  tau_contact = -J_c^T F_c -> (9)
+
+Robot side:
+  H qdd = tau + r_theta - c - g - d*qdot - f*tanh(qdot/eps) + tau_contact
+  qdd  = torch.linalg.solve(H, RHS)
+
+Object side (Newton-Euler):                         (analytic)
+  I_w        = R(r_o) I_b R(r_o)^T
+  vdot_o     = [0,0,-9.81] + F_lin / m_o
+  omegadot_o = I_w^{-1} (F_ang - omega_o x I_w omega_o)
+
+Integration:                                        (analytic)
+  semi-implicit Euler for q, qdot, p_o, v_o, omega_o
+  exponential-map quaternion update for r_o
+\end{lstlisting}
+
+\subsection{Object trajectory prediction: a recursive rollout, not a trajectory decoder}
+\label{sec:object-trajectory-prediction}
+
+The previous subsection described one step of the
+\texttt{RobotObjectMCGDFStep} forward dynamics.  A predicted \emph{object
+trajectory} over a horizon $H$ is produced by chaining $H$ such steps in
+the open-loop rollout implemented by
+\texttt{MultiStepRobotObjectMCGDFWorldModel.forward}.  Given an initial
+state $s_t$ (taken from the last entry of the history window), the per-
+episode context $\xi$ (and latent $z$ when the context encoder is on),
+and the recorded future torque sequence $\tau_{t+1:t+H}$, the model
+iterates
+\begin{equation}
+  s_{t+h+1} \;=\; \mathrm{RobotObjectMCGDFStep}\bigl(s_{t+h},\,\tau_{t+h+1},\,\xi,\,z\bigr),
+  \qquad h = 0, 1, \dots, H-1,
+  \label{eq:trajectory-recursion}
+\end{equation}
+and the predicted object trajectory is the projection
+\begin{equation}
+  \bigl\{(p^o_{t+h+1},\ r^o_{t+h+1},\ v^o_{t+h+1},\ \omega^o_{t+h+1})\bigr\}_{h=0}^{H-1}
+  \subset s_{t+1:t+H}.
+\end{equation}
+The recursion is implemented as a plain Python \texttt{for} loop over the
+horizon dimension of \texttt{future\_torques}; the prediction from step
+$h$ becomes the input to step $h+1$.
+
+\begin{lstlisting}
+# MultiStepRobotObjectMCGDFWorldModel.forward (simplified)
+state = history_states[:, -1]            # initial s_t
+mu, logvar, z, _ = self.encode_context(   # one z per episode (if enabled)
+    history_states, history_torques, deterministic_context=...
+)
+preds = []
+for h in range(future_torques.shape[1]):   # H steps
+    state, aux = self.dynamics(
+        state, future_torques[:, h], damping, friction, object_context, z=z,
+    )
+    preds.append(state)                    # collect s_{t+h+1}
+pred_future = torch.stack(preds, dim=1)    # (B, H, 31)
+\end{lstlisting}
+
+\paragraph{No separate ``trajectory decoder''.}
+There is deliberately no recurrent network, transformer, or
+trajectory-level head that emits $p^o, r^o, v^o, \omega^o$ directly. The
+trajectory is generated by $H$ repeated calls to a single neural net
+(\texttt{ContactWrenchHead}) embedded inside the analytic Newton--Euler
+simulator from Section~\ref{sec:architecture}. All recurrence comes from
+plugging $s_{t+h}$ back in as the input to step $h+1$.
+
+\paragraph{The 6-D bottleneck.}
+A consequence of Eq.~\eqref{eq:trajectory-recursion} is that the entire
+learned signal flowing into the predicted object trajectory at step
+$h$ is
+\begin{equation}
+  F_c(s_{t+h},\,\tau_{t+h+1},\,\xi,\,z) \;\in\; \mathbb{R}^6.
+  \label{eq:six-d-bottleneck}
+\end{equation}
+Everything downstream — Newton's second law for $\dot v^o$, the gyroscopic
+Euler equation for $\dot\omega^o$, semi-implicit Euler for
+$(p^o, v^o, \omega^o)$, and the exponential-map update for $r^o$ — is
+written in PyTorch with no learnable parameters. The object trajectory
+therefore depends on the learned model only through these six numbers per
+step, repeated $H$ times. This is the structural fix for mismatches
+\#1/\#5/\#6/\#7 from the verification report (a single shared
+action-reaction wrench, a built-in gyroscopic term, the world-frame
+inertia, and no redundant $F_{\mathrm{ext}}$ supervision).
+
+\paragraph{What steers the trajectory.}
+The three inputs that effectively determine the predicted object path are
+therefore
+\begin{itemize}
+  \item the \textbf{initial state} $s_t$ (where the cube starts);
+  \item the \textbf{future torque sequence} $\tau_{t+1:t+H}$, which drives
+    the robot side via Eq.~\eqref{eq:mcgdf-robot-coupled} and, through the
+    rolled-out gripper pose, drives $F_c$;
+  \item the \textbf{per-episode context} $\xi$ and the latent $z$
+    (when the context encoder is enabled), which inform $F_c$ about
+    mass, inertia, and material properties.
+\end{itemize}
+
+\subsection{Parameter count}
+
+With the default sizes from Table~\ref{tab:subnets}:
+\begin{itemize}
+  \item DeLaN block (three nets, hidden $=256$, depth $=2$): about
+    $219$~k parameters.
+  \item Residual head (hidden $=128$, depth $=2$): about $21$~k.
+  \item Contact head (hidden $=128$, depth $=3$): about $41$~k.
+  \item Joint damping/friction (when learnable): $18$ scalars.
+\end{itemize}
+Total trainable parameters $\approx 281$~k when
+\texttt{learn\_damping\_friction=False} (the default). Most of the budget
+is spent on the DeLaN block, which is the heaviest because the
+off-diagonal head outputs $36$ values and the inertia heads use the wider
+$256$ hidden width inherited from the GT-dynamics baseline.
+
+\section{Forward Kinematics and Jacobian}
+
+The class \texttt{FrankaForwardKinematics} implements the same fixed-link
+chain as
+\texttt{../GT\_dynamics/eval\_utils.franka\_joint\_and\_gripper\_positions},
+fully differentiable in PyTorch.  All seven arm joints are revolute about
+the local z-axis, so the geometric Jacobian column for joint $i$ is
+\begin{equation}
+  J_i \;=\; \begin{bmatrix} z_i \times (p_{\mathrm{ee}} - p_i) \\ z_i \end{bmatrix},
+\end{equation}
+where $z_i$ is the joint axis and $p_i$ the joint origin, both in the world
+frame, and $p_{\mathrm{ee}}$ is the gripper-tip position (hand frame offset
+by \texttt{tool\_z\_offset}).  The two finger joint columns are zero,
+giving $J_c \in \mathbb{R}^{6\times 9}$ with the last two columns zero.
+
+\section{Contact Wrench Head}
+
+\texttt{ContactWrenchHead} is a small MLP
+\begin{equation}
+  F_c(s,\tau,\xi) \in \mathbb{R}^6,
+  \qquad F_c = (F_c^{\mathrm{lin}},\ F_c^{\mathrm{ang}}).
+\end{equation}
+It takes the full robot+object state, the recorded torque, and the
+per-episode context vector. Its output is interpreted in world frame and
+applied to the cube directly; the robot-side reaction torque is derived in
+Eq.~\eqref{eq:mcgdf-robot-coupled}.
+
+\section{Residual Head and Pre-Contact Baseline}
+
+The residual head $r_\theta(q,\dot q,\tau)$ is the same as in the robot-only
+MCGDF and absorbs the implicit-PD-vs-Python bias plus finite-difference and
+numerical residuals.  Because the per-step implicit residual target
+\begin{equation*}
+  \tau_{\mathrm{ID,GT},t} + d\dot q_t + f\tanh(\dot q_t/\varepsilon_f) - \tau_{\mathrm{applied},t}
+\end{equation*}
+contains both the implicit-PD bias and the contact wrench effect, the
+trainer subtracts the per-episode \emph{pre-contact baseline} of this target
+from the per-step target:
+\begin{align}
+  \mathrm{baseline}_e
+  &= \frac{1}{|\mathrm{pre\,contact}|}
+     \sum_{t\in\mathrm{pre\,contact}}
+     \bigl(\tau_{\mathrm{ID,GT},t} + d\dot q_t + f\tanh(\dot q_t/\varepsilon_f) - \tau_{\mathrm{applied},t}\bigr),
+  \\
+  r_\theta^{\mathrm{target}}_t
+  &= \bigl(\tau_{\mathrm{ID,GT},t} + d\dot q_t + f\tanh(\dot q_t/\varepsilon_f) - \tau_{\mathrm{applied},t}\bigr)
+     - \mathrm{baseline}_e.
+\end{align}
+This is Approach~A of mismatch~\#2.  In effect, the per-episode constant
+``non-contact'' part of the residual is removed before $r_\theta$ sees it,
+and the contact-induced excess is left for the structured
+$\tau_{\mathrm{contact}} = -J_c^\top F_c$ to absorb.
+
+\subsection{Why an internal \texorpdfstring{$F_c$}{F\_c}-based target does
+not replace the baseline}
+\label{sec:residual-identifiability}
+
+A natural-looking alternative is to skip the pre-contact baseline and
+instead define the residual target from the network's own contact-wrench
+output:
+\begin{equation}
+  r_\theta^{\mathrm{target}}_t
+  \;=\;
+  \underbrace{\bigl(\tau_{\mathrm{ID,GT},t} + d\dot q_t + f\tanh(\dot q_t/\varepsilon_f) - \tau_{\mathrm{applied},t}\bigr)}_{=:\,\rho_t\ \text{(observed residual)}}
+  \;+\; J_c(q_t)^\top F_c^{\mathrm{NN}}(s_t,\tau_t,\xi).
+  \label{eq:residual-Fc-target}
+\end{equation}
+The intuition is that when $F_c^{\mathrm{NN}}\!\approx 0$ (pre-contact) the
+target reduces to the robot-only residual, and when $F_c^{\mathrm{NN}}$
+becomes non-zero (contact) the target self-adjusts. This scheme fails for
+the following reason.
+
+\paragraph{Identifiability collapse.}
+Substituting Eq.~\eqref{eq:residual-Fc-target} into the supervised loss
+gives
+\begin{equation}
+  \bigl\|r_\theta - r_\theta^{\mathrm{target}}\bigr\|^2
+  \;=\;
+  \bigl\|(r_\theta - J_c^\top F_c^{\mathrm{NN}}) - \rho_t\bigr\|^2,
+  \label{eq:residual-Fc-collapse}
+\end{equation}
+which is exactly the robot inverse-dynamics constraint: the net learned
+residual force on the joints must match the observed residual
+$\rho_t$. The existing $\mathcal{L}_{\mathrm{robotGT}}$ and the rollout
+MSE already enforce this constraint. Eq.~\eqref{eq:residual-Fc-target}
+therefore adds no information about the individual pieces
+$(r_\theta,\,F_c)$. The loss is exactly zero everywhere on the hyperplane
+\begin{equation}
+  \mathcal{H}_t \;=\;
+  \bigl\{(r_\theta,\,F_c)\ :\ r_\theta - J_c^\top F_c = \rho_t\bigr\},
+\end{equation}
+which includes both extreme degeneracies
+$(r_\theta=\rho_t,\,F_c=0)$ and
+$(r_\theta=0,\,F_c$ does everything$)$, and the symmetry between them is
+not broken by any other term in the loss except $\lambda_{\mathrm{contact}}\|F_c\|^2$,
+which actively prefers $F_c\!\to\!0$ — i.e.\ the failure mode where
+contact is silently absorbed by $r_\theta$.
+
+\paragraph{Bootstrap noise.}
+Early in training $F_c^{\mathrm{NN}}$ is random and so is the supervised
+target in Eq.~\eqref{eq:residual-Fc-target}. Detaching gradients
+(target-network style) keeps the optimization stable but does not
+restore identifiability; it only converts fast oscillation into slow
+drift along $\mathcal{H}_t$.
+
+\paragraph{Why the baseline works where this does not.}
+An identifiability ambiguity between $r_\theta$ and $F_c$ can only be
+broken by a label that depends on \emph{one} of the two unknowns. The
+pre-contact baseline supplies such a label for $r_\theta$ on a subset of
+frames: it uses the external, dataset-level fact that pre-contact frames
+have no contact to assert
+$r_\theta^{\mathrm{target}}_t \approx 0$ for $t \in \mathrm{pre\,contact}$.
+The direct contact-force proxy in
+Section~\ref{sec:future-contact-proxy} supplies the symmetric label for
+$F_c^{\mathrm{lin}}$. Any scheme that constrains only the combination
+$r_\theta - J_c^\top F_c$, including
+Eq.~\eqref{eq:residual-Fc-target}, is invariant along $\mathcal{H}_t$ and
+cannot separate the two heads.
+
+\section{Loss}
+
+The total loss is
+\begin{equation}
+  \mathcal{L} =
+  \mathcal{L}_{\mathrm{rollout}}
+  + \mathcal{L}_{\mathrm{robotGT}}
+  + \mathcal{L}_{\mathrm{objectGT}}
+  + \mathcal{L}_{\mathrm{DF}}
+  + \mathcal{L}_{\mathrm{res,sup}}
+  + \mathcal{L}_{\mathrm{reg}}
+  + \mathcal{L}_{\mathrm{L2}}.
+\end{equation}
+\begin{itemize}
+  \item $\mathcal{L}_{\mathrm{rollout}}$: weighted MSE on robot state and
+    object pose / velocity (sign-invariant quaternion MSE).
+  \item $\mathcal{L}_{\mathrm{robotGT}}$: same supervision as the robot-only
+    MCGDF for $M, M\ddot q, c, g, \ddot q, \tau_{\mathrm{ID}}$.
+  \item $\mathcal{L}_{\mathrm{objectGT}}$: weighted MSE on $\dot v^o$ and
+    $\dot\omega^o$ only.  The linearly dependent $F_{\mathrm{ext}}$ target
+    is dropped (mismatch~\#7).
+  \item $\mathcal{L}_{\mathrm{DF}}$: optional supervision of learnable
+    damping/friction scalars against dataset values.
+  \item $\mathcal{L}_{\mathrm{res,sup}}$: direct supervision of $r_\theta$
+    against the baseline-subtracted target.
+  \item $\mathcal{L}_{\mathrm{reg}}$: small L2 regularization on the
+    Coriolis term, the residual head magnitude, and the contact wrench
+    magnitude.  The contact-wrench regularizer encourages $F_c$ to remain
+    near zero on pre-contact windows.
+  \item $\mathcal{L}_{\mathrm{L2}}$: explicit L2 penalty on trainable weight
+    matrices.
+\end{itemize}
+
+\section{Caveats}
+
+\begin{itemize}
+  \item \emph{Contact point approximation.}  The Jacobian
+    \texttt{FrankaForwardKinematics.jacobian} uses the gripper midpoint as
+    the contact location.  Two-finger contacts with distinct contact points
+    would require per-finger Jacobians; this is the natural next refinement.
+  \item \emph{Friction-cone constraint.}  $F_c$ is unconstrained.  Adding a
+    learned friction coefficient and projecting onto the cone
+    $\|F_c^{\mathrm{tan}}\|\le\mu\,F_c^{\mathrm{n}}$ would improve
+    physical consistency at the cost of training-time non-smoothness.
+  \item \emph{Pre-contact baseline assumes a single contact onset per
+    episode.}  Re-contacts or multi-phase contact patterns are not currently
+    treated separately.  A future variant would window the baseline locally.
+  \item \emph{Approach B of mismatch~\#2 (frozen robot-only $r_\theta$).}
+    Not yet implemented.  When ready, the trainer would load a robot-only
+    MCGDF checkpoint and use its $r_\theta$ output as the supervision target
+    here, replacing the per-episode baseline.
+  \item The damping double-counting caveat carried over from the robot-only
+    MCGDF still applies (see
+    \texttt{../../Robot\_only/MCGDF/robot\_only\_mcgdf\_description.tex},
+    Caveats); the default \texttt{--omit\_damping} flag avoids it.
+  \item \emph{Ground-truth physical context at evaluation
+    (train/eval asymmetry).}
+    \label{caveat:gt-context-eval}
+    The current evaluation scripts
+    (\texttt{plot\_multistep\_trajectory.py},
+    \texttt{animate\_episode.py}) feed the dataset-recorded
+    $\xi = [m_o,\ I_b,\ \mu_o]$ directly into the model at every rollout
+    step. $\xi$ enters two places:
+    (i)~as part of the \texttt{ContactWrenchHead} input concatenation, and
+    (ii)~as the mass and inertia driving the analytic Newton--Euler
+    integrator
+    (Eqs.~\eqref{eq:mcgdf-object-linear}--\eqref{eq:mcgdf-Iw}).
+    Reported gripper / cube prediction errors therefore use \emph{oracle
+    physics} and are an upper bound on the accuracy this architecture
+    could reach in deployment, not a deployment estimate. The latent
+    $z\sim q(z\mid\text{history})$ produced by the
+    \texttt{ContextEncoder} is layered on top of $\xi$ rather than
+    replacing it. A symmetric ``no oracle at evaluation'' protocol is
+    proposed in
+    Section~\ref{sec:future-eval-no-gt-context}.
+\end{itemize}
+
+\section{Future Works}
+
+\subsection{Direct contact-force proxy supervision}
+\label{sec:future-contact-proxy}
+
+The contact wrench head $F_c(s,\tau,\xi) \in \mathbb{R}^6$ is currently
+trained without any direct ground-truth label. It is shaped indirectly by
+three signals: (i)~the rollout MSE through the
+$-J_c^\top F_c$ coupling on the robot side, (ii)~the object linear- and
+angular-acceleration supervision through
+Eqs.~\eqref{eq:mcgdf-object-linear}--\eqref{eq:mcgdf-object-angular}, and
+(iii)~the L2 regularizer $\lambda_{\mathrm{contact}}\|F_c\|^2$ that biases
+$F_c$ toward zero in pre-contact windows. PhysX does not expose the
+gripper--cube pair impulse through the Isaac~Lab observation API, so the
+recorder cannot emit a per-step contact wrench at the time of writing.
+
+The dataset does, however, contain the field
+\begin{equation}
+  F_{\mathrm{ext,GT},t}
+  \;=\;
+  \mathtt{object\_dynamics/external\_force\_est\_w}_t
+  \;=\;
+  m_o\,\bigl(\dot v^o_t - g_w\bigr) \in \mathbb{R}^3,
+  \label{eq:future-fext-recipe}
+\end{equation}
+which is exactly Newton's second law on the cube, solved for the net
+external (i.e.\ contact) force, using the finite-difference linear
+acceleration $\dot v^o_t$ as recorded. Up to the FD noise inherent in
+$\dot v^o_t$, this is a per-step \emph{label} for $F_c^{\mathrm{lin}}$.
+
+\paragraph{Proposed loss term.}
+We add a per-step supervised contact-force loss
+\begin{equation}
+  \mathcal{L}_{\mathrm{contact,sup}}
+  \;=\;
+  \lambda_{\mathrm{cs}}
+  \,\frac{1}{T}\sum_{t=1}^{T}
+  \bigl\| F_c^{\mathrm{lin}}(s_t,\tau_t,\xi) - F_{\mathrm{ext,GT},t} \bigr\|_2^2,
+  \label{eq:future-contact-sup-loss}
+\end{equation}
+folded into the total loss alongside the existing
+$\mathcal{L}_{\mathrm{objectGT}}$,
+$\mathcal{L}_{\mathrm{res,sup}}$, and $\mathcal{L}_{\mathrm{reg}}$ terms.
+A new CLI flag \texttt{--lambda\_contact\_sup} (default $0$, opt-in)
+controls the weight, mirroring how
+\texttt{--lambda\_object\_lin\_acc} and \texttt{--lambda\_contact} are
+currently exposed.
+
+\paragraph{Relationship to existing object supervision.}
+Eq.~\eqref{eq:future-fext-recipe} and the recorded
+$\dot v^o_t$ target used by $\mathcal{L}_{\mathrm{objectGT}}$ are linearly
+dependent through the scalar $m_o$:
+\begin{equation}
+  F_{\mathrm{ext,GT},t} = m_o\,\dot v^o_t - m_o\,g_w.
+\end{equation}
+Therefore Eq.~\eqref{eq:future-contact-sup-loss} mostly \emph{duplicates}
+the lin-acc head of $\mathcal{L}_{\mathrm{objectGT}}$ up to a constant
+rescaling and offset. It is not a new independent label. Its practical
+value is twofold:
+\begin{itemize}
+  \item It places the supervision \emph{directly} on
+    $F_c^{\mathrm{lin}}$, where gradient flow through the analytic
+    Newton--Euler step is removed. This reduces the chain length on
+    which the lin-acc loss must rely and, in our experience with the
+    robot-only residual head, tends to stabilize early training.
+  \item It exposes $\lambda_{\mathrm{cs}}$ as a separate scalar from
+    $\lambda_{\mathrm{object\,lin\,acc}}$, letting the practitioner
+    weight the two paths independently if FD noise on $\dot v^o_t$ is
+    being amplified by the $m_o$ scaling.
+\end{itemize}
+Because of this redundancy, the recommended default is
+$\lambda_{\mathrm{cs}}=0$ with $\lambda_{\mathrm{object\,lin\,acc}}>0$;
+the proxy loss is meant as a diagnostic switch, not an additive
+improvement.
+
+\paragraph{Caveats.}
+\begin{itemize}
+  \item \emph{Not a true ground-truth contact force.} Eq.~\eqref{eq:future-fext-recipe}
+    is computed from the recorded $\dot v^o_t$, which itself is a
+    finite-difference estimate of the cube's world-frame linear
+    acceleration. Any FD noise propagates into the label, and that noise
+    is amplified by the factor $m_o$ (typically $\mathcal{O}(0.1\,\mathrm{kg})$
+    for the cube, but more generally context-dependent through $\xi$).
+  \item \emph{No equivalent shortcut for $F_c^{\mathrm{ang}}$.}
+    The recorded $\dot\omega^o$ supervises the angular branch only through
+    the full gyroscopic equation
+    Eq.~\eqref{eq:mcgdf-object-angular}, which depends on $I_w(r^o)$ and
+    $\omega^o\!\times\!(I_w\omega^o)$. There is no scalar-rescaled
+    label for $F_c^{\mathrm{ang}}$ analogous to
+    Eq.~\eqref{eq:future-fext-recipe}. The angular wrench therefore
+    remains trained only through the rollout MSE and the angular branch
+    of $\mathcal{L}_{\mathrm{objectGT}}$.
+  \item \emph{Pre-contact regime.} On pre-contact frames, both
+    $F_{\mathrm{ext,GT},t}$ and the target for $F_c^{\mathrm{lin}}$ are
+    approximately zero (up to gravity already removed in the recipe).
+    Adding Eq.~\eqref{eq:future-contact-sup-loss} on pre-contact windows
+    is therefore consistent with $\lambda_{\mathrm{contact}}\|F_c\|^2$
+    and does not require a separate masking schedule.
+\end{itemize}
+
+\subsection{Alternative routes for a true contact-wrench label}
+
+The proxy in Eq.~\eqref{eq:future-fext-recipe} is bounded above by the FD
+quality of $\dot v^o_t$ and cannot supervise $F_c^{\mathrm{ang}}$. Two
+heavier-touch options would provide a genuine, low-noise label:
+\begin{itemize}
+  \item \emph{Extend the recorder to log PhysX
+    \texttt{body\_incoming\_joint\_wrench\_b}.} This API returns the
+    wrench transmitted through an articulation joint. For the cube it is
+    of limited use because the cube is a \emph{free body}, not an
+    articulation link, and so the wrench would be reported as zero. The
+    useful application of this signal is on the Franka side: querying
+    the wrench at the hand--finger joints exposes the contact wrench in
+    a body frame, which after a known finger-to-world rotation gives a
+    direct label for the wrench the gripper applies to the cube
+    (Newton's third law gives $F_c$ in world frame).
+  \item \emph{Add a custom Isaac~Lab observation that reads the PhysX
+    contact buffer directly.} PhysX maintains per-pair contact impulses
+    at the contact-point level; aggregating impulses over all
+    cube--gripper contact pairs and dividing by $\Delta t$ yields a
+    per-step ground-truth $F_c$ (and, with the contact-point offset,
+    a torque about the cube center). This is the most invasive option,
+    requiring a new observation term in
+    \texttt{robot\_object\_mcgdf\_env\_cfg.py} and a new field in
+    \texttt{RobotObjectMCGDFRolloutDataset}, but it produces the only
+    truly unambiguous label for the full $F_c \in \mathbb{R}^6$.
+\end{itemize}
+Either route would replace Eq.~\eqref{eq:future-contact-sup-loss} with a
+direct $\|F_c - F_c^{\mathrm{GT}}\|^2$ term and remove the FD-noise
+caveat.
+
+\subsection{Coupling-driven object dynamics with an online latent context update}
+\label{sec:future-eval-no-gt-context}
+
+This subsection replaces an earlier sketch in which the explicit
+physical context $\xi = [m_o,\ I_b,\ \mu_o]$ was estimated by a
+regression head $\hat\xi(z)$ and substituted at evaluation. Two
+practitioner-side concerns rule that earlier sketch out:
+\begin{enumerate}
+  \item Forcing $z$ to predict the dataset's $\xi$ pins a fixed semantic
+    role on the latent (``the model's guess at $\xi$'') and adds
+    parameters (a Cholesky-parameterized $3\times 3$ inertia and a
+    softplus mass head). The latent should be free to encode whatever
+    residual context is useful, not a copy of the recorded labels.
+  \item Treating the latent as a single one-shot encoding of an initial
+    history window throws away later contact evidence. The
+    instantaneous discrepancy between the model's prediction and the
+    actually observed cube motion is exactly the signal that ought to
+    refine the latent over time.
+\end{enumerate}
+Two structural changes are therefore proposed.
+
+\paragraph{Change 1 -- object state predicted from the robot's ODE
+plus a contact-gated coupling, instead of from Newton--Euler.}
+The free-rigid-body integrator
+Eqs.~\eqref{eq:mcgdf-object-linear}--\eqref{eq:mcgdf-quat-exp} is removed
+from the object side. The object substate
+$(p^o, r^o, v^o, \omega^o)$ is instead driven by the gripper kinematics
+through a learned, state-dependent coupling factor
+$\alpha_t \in [0,1]$ that gates ``how attached'' the cube is to the
+gripper at the current step. Concretely, let
+\begin{equation}
+  \mathbf{d}_t \;=\; p_g(q_t) - p^o_t \;\in\;\mathbb{R}^3,
+  \qquad
+  \alpha_t \;=\; \sigma\!\bigl(\mathrm{MLP}_\alpha(\|F_c^{\mathrm{lin}}\|,\,\mathbf{d}_t,\,z_t)\bigr),
+  \label{eq:future-coupling-alpha}
+\end{equation}
+where $p_g(q)$ is the analytic gripper-tip position from
+\texttt{FrankaForwardKinematics} and the gripper twist
+$(v_g, \omega_g) = J(q)\dot q$ is the existing geometric Jacobian
+product. The cube state is then advanced by blending the gripper twist
+into the cube twist:
+\begin{align}
+  v^o_{t+1}      &= \alpha_t\,v_g(q_t,\dot q_t)
+                   \;+\; (1-\alpha_t)\,\rho_v\,v^o_t,
+                   \label{eq:future-vobj}\\
+  \omega^o_{t+1} &= \alpha_t\,\omega_g(q_t,\dot q_t)
+                   \;+\; (1-\alpha_t)\,\rho_\omega\,\omega^o_t,
+                   \label{eq:future-womega}\\
+  p^o_{t+1}      &= p^o_t \;+\; v^o_{t+1}\,\Delta t,
+                   \label{eq:future-pobj}\\
+  r^o_{t+1}      &= r^o_t \otimes \exp\!\bigl(\tfrac{1}{2}\omega^o_{t+1}\,\Delta t\bigr),
+                   \label{eq:future-robj}
+\end{align}
+where $\rho_v,\rho_\omega\in(0,1]$ are small learned decay scalars
+(softplus-bounded) that model passive ``rest on the table'' losses.
+Intuition: when the gripper is close to the cube and pressing on it,
+$\alpha_t\!\to\!1$ and the cube inherits the gripper's twist; when out
+of contact, $\alpha_t\!\to\!0$ and the cube's twist relaxes to zero so
+$p^o$, $r^o$ stay put. No $m_o$, $I_b$ or $\mu_o$ appears anywhere in
+Eqs.~\eqref{eq:future-vobj}--\eqref{eq:future-robj}.
+
+\paragraph{What is gained, and what is lost, by Change 1.}
+\emph{Gained.} The object-side parameter budget collapses to one small
+MLP for $\alpha_t$ and two scalars $\rho_v,\rho_\omega$. The dataset's
+$\xi$ never enters the model's forward pass at any time, so there is
+no GT-at-eval question to answer: $\xi$ becomes purely a label used by
+training-time losses. The inductive bias ``the cube only moves when
+carried'' matches the Franka Lift task structurally and is robust
+out-of-distribution as long as that dichotomy holds.\\
+\emph{Lost.} The object side no longer obeys Newton--Euler. Cases the
+new integrator cannot represent include ballistic motion (a thrown
+cube), free spinning after release, motion driven by an external
+impulse other than the gripper, and any task where the cube's mass or
+inertia visibly governs its trajectory. The 6-D wrench $F_c$ now
+enters Eq.~\eqref{eq:future-coupling-alpha} only through
+$\|F_c^{\mathrm{lin}}\|$ as a gating signal; it no longer constrains
+the cube's acceleration via $F = m a$. For the Lift task this trade is
+acceptable, but it should be flagged for any task that involves true
+free-flight phases.
+
+\paragraph{Change 2 -- online latent update from the per-step
+prediction residual.}
+The variational $z$ is currently produced once at the start of the
+rollout from a $K$-step history window and held fixed for the full
+horizon $H$. The proposed change is to make $z$ \emph{evolve over
+time}, refined at every step by the one-step prediction residual:
+\begin{equation}
+  e_t \;=\; \mathrm{Proj}_{\mathrm{obj}}\!\bigl(s_t^{\mathrm{obs}} - \hat s_t\bigr)
+  \;\in\;\mathbb{R}^{13},
+  \qquad
+  z_t \;=\; z_{t-1} \;+\; \mathrm{GatedUpdate}\!\bigl(z_{t-1},\,e_t,\,F_c^{t-1}\bigr).
+  \label{eq:future-latent-online-update}
+\end{equation}
+Here $\hat s_t$ is the model's one-step prediction made under
+$z_{t-1}$, $\mathrm{Proj}_{\mathrm{obj}}$ selects the object substate
+($p^o, r^o, v^o, \omega^o$) from the residual since that is the part
+the contact dynamics can do something about, and
+$\mathrm{GatedUpdate}$ is a small GRU-style cell of width
+$\mathrm{latent\_dim}$ -- think of it as the analog of a Kalman
+innovation update on $z$. The initial value $z_0$ is still produced by
+the existing \texttt{ContextEncoder} from the warm-up window so the
+filter has a sensible prior to start from.
+
+Conceptually this turns $z$ from a one-shot encoding into a sequential
+posterior estimate: each frame of newly-observed contact behaviour
+nudges $z$ in the direction the model needed in order to have been
+correct, and the next $F_c$ and $\alpha$ benefit from that correction
+without any additional supervised label.
+
+\paragraph{Training-time protocol.}
+At training time, the closed-loop residual signal is always available
+(the dataset supplies $s_t^{\mathrm{obs}}$). The trainer therefore
+runs the model in \emph{closed-loop on a sliding window} of length
+$L_{\mathrm{filter}}$:
+\begin{lstlisting}
+z = ContextEncoder(history[:K])              # prior from warm-up window
+for t in range(K, K + L_filter):             # closed-loop filter window
+    s_hat = OneStep(s_obs[t-1], tau[t], z)
+    e     = Proj_obj(s_obs[t] - s_hat)
+    z     = z + GatedUpdate(z, e, F_c)
+for h in range(rollout_horizon):             # open-loop rollout window
+    s = OneStep(s, tau[K + L_filter + h], z) # z is frozen here
+\end{lstlisting}
+The supervised losses (rollout MSE, robot- and object-dynamics
+supervision, residual head with pre-contact baseline, KL on $z_0$)
+operate on the rollout-window predictions versus
+$s^{\mathrm{obs}}_{K+L_{\mathrm{filter}}:K+L_{\mathrm{filter}}+H}$ as
+today. Truncated BPTT through the filter recurrence over
+$L_{\mathrm{filter}}$ steps keeps the backward pass affordable.
+The GT context $\xi$ is now used \emph{only} by the supervised losses
+(InfoNCE anchor on $z_0$, object-dynamics targets, residual-baseline
+computation); it never enters the model's forward pass.
+
+\paragraph{Evaluation-time protocol.}
+The same protocol applies, with one critical observation: during the
+filter window the model is permitted to read the dataset's
+$s_t^{\mathrm{obs}}$ because that information is also available in
+deployment from cheap, GT-context-free sensors (joint encoders plus
+the recorded cube pose from an onboard RGB-D pipeline). It is not
+``oracle context.'' The open-loop rollout window then uses the
+filter-refined $z_{K+L_{\mathrm{filter}}}$ and predicts forward without
+peeking. Evaluation scripts gain a single flag
+\texttt{--filter\_steps} controlling $L_{\mathrm{filter}}$; the
+existing \texttt{start\_t} and \texttt{rollout\_steps} continue to
+control the rollout window.
+
+\paragraph{Open design choices to discuss.}
+\begin{itemize}
+  \item \emph{Object-only vs.\ full residual in $e_t$.} Restricting $e_t$
+    to the object substate (as written) focuses the filter on the
+    contact-coupled coordinates and avoids being driven by
+    joint-tracking noise on the robot side. Using the full $31$-vector
+    is simpler but noisier; this is a small ablation.
+  \item \emph{Single $\alpha_t$ vs.\ two-component $(\alpha^{\mathrm{rigid}}, \alpha^{\mathrm{slide}})$.}
+    A single scalar conflates two regimes the dataset actually contains:
+    ``cube rigidly held by closed gripper'' and ``cube sliding under
+    pushing contact.''  A two-headed $\alpha_t$ -- one rigid, one tangential --
+    would generalise to in-plane pushing without sacrificing the lift
+    inductive bias.
+  \item \emph{Keep $F_c \in \mathbb{R}^6$ or replace by a scalar
+    contact head?} $F_c$ no longer drives the object integrator, only
+    the gating. We recommend keeping the 6-D shape so the robot-side
+    coupling $-J_c^\top F_c$ (Newton's third law on the robot, the
+    structural reason the robot+object split exists) is preserved and
+    the residual head $r_\theta$ does not have to absorb the contact
+    reaction torque.
+  \item \emph{Where the warm-up $K$ and filter $L_{\mathrm{filter}}$
+    are reported.} The reported open-loop horizon-$H$ error becomes a
+    function of $(K, L_{\mathrm{filter}}, H)$; a sweep over
+    $L_{\mathrm{filter}}$ is the natural plot to show the value of the
+    online filter -- error should drop monotonically with
+    $L_{\mathrm{filter}}$ until the latent saturates.
+  \item \emph{Relation to the project proposal's Pi-CDD year-1.} The
+    filter recurrence Eq.~\eqref{eq:future-latent-online-update} is
+    exactly the time-evolving ``Context $c_t$'' channel sketched in the
+    proposal's Figure 1, with the difference that $c_t$ here is updated
+    by an innovation rather than by re-encoding a sliding window. The
+    coupling formulation Eqs.~\eqref{eq:future-vobj}--\eqref{eq:future-robj}
+    fits the proposal's ``Action--Reaction'' framing because $\alpha_t$
+    is precisely the model's read of how strongly the gripper action is
+    coupled to the object reaction at the current step.
+\end{itemize}
+
+\paragraph{What this looks like at the code level (sketch).}
+\begin{itemize}
+  \item \emph{models.py.} Replace \texttt{RobotObjectMCGDFStep.\_object\_dynamics}
+    with the coupling block in
+    Eqs.~\eqref{eq:future-coupling-alpha}--\eqref{eq:future-robj}.
+    Add a small \texttt{CouplingHead} (MLP) and a
+    \texttt{LatentInnovationUpdate} (GRUCell-style) module. The DeLaN
+    block, residual head, contact-wrench head, FK chain, and quaternion
+    exp map are unchanged.
+  \item \emph{wm\_train.py.} Add \texttt{--filter\_steps} CLI flag.
+    Modify \texttt{run\_epoch} to run the closed-loop filter window
+    before the open-loop rollout window; the supervised losses keep
+    their current API.  Optionally drop or down-weight the existing
+    KL-only-on-$z_0$ term in favour of a small KL prior on the
+    sequence $(z_K, z_{K+1}, \dots)$.
+  \item \emph{plot\_multistep\_trajectory.py / animate\_episode.py.}
+    Add \texttt{--filter\_steps} and route the filter window through
+    the existing \texttt{model.encode\_context} +
+    \texttt{LatentInnovationUpdate} path. No GT $\xi$ is loaded for
+    the model forward pass; the regression-head substitution sketched
+    in the previous (superseded) plan is not needed.
+\end{itemize}
+
+\paragraph{Status of the previous plan.}
+The earlier sketch of training a 13-dim $\hat\xi(z)$ regression head
+and substituting $\hat\xi$ at evaluation is dropped; this subsection
+replaces it.
+
+\subsection{Other planned extensions}
+
+\begin{itemize}
+  \item \emph{Approach~B of mismatch~\#2 (frozen robot-only $r_\theta$
+    as supervision).} Train a robot-only MCGDF first, freeze its
+    $r_\theta$ output, and use it as the supervision target for the
+    residual head here, replacing the per-episode pre-contact baseline.
+    This removes the assumption of a single contact onset per episode
+    and would be the natural pairing with the per-pair contact-buffer
+    route above.
+  \item \emph{FiLM-modulated DeLaN heads.} Inject the per-episode
+    context $\xi$ into the DeLaN block via FiLM layers, matching the
+    treatment of $r_\theta$ and $F_c$. The current implementation
+    leaves $H,c,g$ context-free because the robot is fixed across
+    episodes; this remains correct when only the cube changes, but
+    becomes necessary once payload or in-hand objects affect the
+    effective robot inertia.
+  \item \emph{Per-finger Jacobians and friction cone.} Replace the
+    single-midpoint Jacobian with per-finger Jacobians and constrain
+    $F_c$ to lie inside a learned friction cone
+    $\|F_c^{\mathrm{tan}}\|\le \mu(\xi)\,F_c^{\mathrm{n}}$. This pairs
+    naturally with the explicit contact-buffer label, which already
+    provides per-contact normals.
+\end{itemize}
+
+\end{document}
