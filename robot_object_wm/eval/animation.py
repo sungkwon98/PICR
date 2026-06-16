@@ -80,6 +80,7 @@ def render_checkpoint_animation(
         episode_index=episode_index,
         episode_name=episode_name,
         robot_dof=cfg.robot_dof,
+        action_dim=cfg.action_dim,
         torque_dim=cfg.torque_dim,
         torque_key=cfg.torque_key,
         subtract_env_origin=cfg.subtract_env_origin,
@@ -121,6 +122,7 @@ def render_dataset_animation(
     episode_index: int = 0,
     episode_name: str | None = None,
     robot_dof: int = 9,
+    action_dim: int = 8,
     torque_dim: int = 9,
     torque_key: str = "applied_torque",
     subtract_env_origin: bool = True,
@@ -139,6 +141,7 @@ def render_dataset_animation(
         episode_index=episode_index,
         episode_name=episode_name,
         robot_dof=robot_dof,
+        action_dim=action_dim,
         torque_dim=torque_dim,
         torque_key=torque_key,
         subtract_env_origin=subtract_env_origin,
@@ -438,12 +441,13 @@ def cube_corners(center: np.ndarray, quat: np.ndarray, size: float) -> np.ndarra
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render WMDynamics dataset/prediction animation.")
-    parser.add_argument("--dataset_file", required=True)
-    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--dataset_file", type=str, default="./dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep.hdf5")
+    parser.add_argument("--checkpoint", type=str, default="./outputs_wm_dynamics/run_20260616_000244/best.pt")
     parser.add_argument("--output", type=str, default="./eval_outputs/wm_dynamics_episode.mp4")
     parser.add_argument("--episode_index", type=int, default=0)
     parser.add_argument("--episode_name", type=str, default=None)
     parser.add_argument("--robot_dof", type=int, default=9)
+    parser.add_argument("--action_dim", type=int, default=8)
     parser.add_argument("--torque_dim", type=int, default=9)
     parser.add_argument("--torque_key", choices=("applied_torque", "computed_torque"), default="applied_torque")
     parser.add_argument("--no_subtract_env_origin", dest="subtract_env_origin", action="store_false", default=True)
@@ -487,6 +491,7 @@ def main(argv: list[str] | None = None) -> None:
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             robot_dof=args.robot_dof,
+            action_dim=args.action_dim,
             torque_dim=args.torque_dim,
             torque_key=args.torque_key,
             subtract_env_origin=args.subtract_env_origin,

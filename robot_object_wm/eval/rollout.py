@@ -28,7 +28,8 @@ from robot_object_wm.eval.plots import (
     save_trajectory_plot,
 )
 from robot_object_wm.models.utils import FrankaForwardKinematics
-from robot_object_wm.training.train import MODEL_NAME, TrainConfig, build_model, parse_args
+from robot_object_wm.models.rwm import RWMEnsemble
+from robot_object_wm.training.train import MODEL_NAME, RWMConfig, TrainConfig, build_model, parse_args
 
 EvalSplit = Literal["all", "train", "val"]
 
@@ -46,6 +47,7 @@ class LoadedWorldModel:
     checkpoint_path: str
     model: torch.nn.Module
     config: TrainConfig
+    rwm_config: RWMConfig | None
     architecture: str
     layout: dict[str, Any]
     data_meta: dict[str, Any]
@@ -98,7 +100,8 @@ def load_checkpoint_model(
     torch_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     checkpoint = torch.load(resolved_path, map_location=torch_device, weights_only=False)
     cfg = config_from_checkpoint(checkpoint)
-    model = build_model(cfg).to(torch_device)
+    rwm_cfg = rwm_config_from_checkpoint(checkpoint)
+    model = build_model(cfg, device=torch_device, rwm_cfg=rwm_cfg).to(torch_device)
     try:
         model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
     except RuntimeError as exc:
@@ -108,6 +111,7 @@ def load_checkpoint_model(
         checkpoint_path=resolved_path,
         model=model,
         config=cfg,
+        rwm_config=rwm_cfg,
         architecture=str(checkpoint.get("architecture", MODEL_NAME)),
         layout=dict(checkpoint.get("layout", {})),
         data_meta=dict(checkpoint.get("data_meta", {})),
@@ -129,6 +133,15 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> TrainConfig:
     valid_fields = {field.name for field in fields(TrainConfig)}
     merged = defaults | {key: value for key, value in saved.items() if key in valid_fields}
     return TrainConfig(**merged)
+
+
+def rwm_config_from_checkpoint(checkpoint: dict[str, Any]) -> RWMConfig | None:
+    saved = checkpoint.get("rwm_config")
+    if not isinstance(saved, dict):
+        return None
+    valid_fields = {field.name for field in fields(RWMConfig)}
+    values = asdict(RWMConfig()) | {key: value for key, value in saved.items() if key in valid_fields}
+    return RWMConfig(**values)
 
 
 def make_eval_loader(
@@ -268,6 +281,9 @@ def predict_batch(
     batch: dict[str, Any],
     device: torch.device,
 ) -> torch.Tensor:
+    if isinstance(model, RWMEnsemble) or getattr(model, "model_type", None) == "rwm":
+        return predict_rwm_batch(model, batch, device)
+
     history_states = batch["history_states"].to(device)
     future_torques = batch["future_torques"].to(device)
     object_context = batch["object_context"].to(device)
@@ -279,6 +295,42 @@ def predict_batch(
         history_torques=history_torques,
         return_aux=False,
     )
+
+
+def predict_rwm_batch(
+    model: torch.nn.Module,
+    batch: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor:
+    history_states = batch["history_states"].to(device)
+    action_type = str(getattr(model, "action_type", "torque")).strip().lower()
+    if action_type == "policy":
+        history_actions = batch["history_actions"].to(device)
+        future_actions = batch["future_actions"].to(device)
+        first_actions = torch.cat([history_actions, future_actions[:, :1]], dim=1)
+    elif action_type == "torque":
+        first_actions = batch["history_torques"].to(device)
+        future_actions = batch["future_torques"].to(device)
+    else:
+        raise ValueError(f"RWM action_type must be 'policy' or 'torque', got {action_type!r}.")
+
+    pred_steps: list[torch.Tensor] = []
+    try:
+        if hasattr(model, "reset"):
+            model.reset()
+        x_state = history_states
+        for step in range(future_actions.shape[1]):
+            x_action = first_actions if step == 0 else future_actions[:, step : step + 1]
+            pred_state, _aleatoric, _epistemic = model(x_state, x_action)
+            pred_steps.append(pred_state)
+            x_state = pred_state.unsqueeze(1)
+    finally:
+        if hasattr(model, "reset"):
+            model.reset()
+
+    if not pred_steps:
+        return history_states.new_empty((history_states.shape[0], 0, history_states.shape[-1]))
+    return torch.stack(pred_steps, dim=1)
 
 
 def _resolve_hdf5_paths(*, dataset_file: str | None, dataset_dir: str) -> list[str]:
@@ -490,6 +542,7 @@ def _write_episode_plot(args, loaded: LoadedWorldModel, dataset_file: str) -> di
         episode_index=args.episode_index,
         episode_name=args.episode_name,
         robot_dof=cfg.robot_dof,
+        action_dim=cfg.action_dim,
         torque_dim=cfg.torque_dim,
         torque_key=cfg.torque_key,
         subtract_env_origin=cfg.subtract_env_origin,
@@ -566,6 +619,7 @@ def _write_prediction_metrics(args, loaded: LoadedWorldModel, dataset_file: str)
         dataset_file,
         max_episodes=args.prediction_max_episodes,
         robot_dof=cfg.robot_dof,
+        action_dim=cfg.action_dim,
         torque_dim=cfg.torque_dim,
         torque_key=cfg.torque_key,
         subtract_env_origin=cfg.subtract_env_origin,

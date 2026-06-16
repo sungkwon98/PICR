@@ -5,9 +5,9 @@ import json
 import os
 import random
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin, get_type_hints
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -27,14 +27,31 @@ from robot_object_wm.models.world_model import (
     context_kl_loss,
     weighted_rollout_mse,
 )
+from robot_object_wm.models.rwm import RWMEnsemble
 from robot_object_wm.models.whole_dynamics import WholeWMDynamicsConfig, build_whole_wm_dynamics
 from robot_object_wm.training.checkpoint import checkpoint_and_log_epoch, start_training_run
 from robot_object_wm.training.losses import MetricAverager
-from robot_object_wm.training.helper import add_wandb_args, set_seed
+from robot_object_wm.training.helper import set_seed
 
 MODEL_NAME = "WMDynamics"
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PACKAGE_ROOT / "configs" / "train_config.yaml"
+DEFAULT_RWM_CONFIG_PATH = PACKAGE_ROOT / "configs" / "rwm_config.yaml"
+NONE_STRINGS = {"", "none", "null", "nil"}
+TRUE_STRINGS = {"1", "true", "t", "yes", "y", "on"}
+FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
+FIELD_CHOICES = {
+    "model_type": ("split", "whole", "rwm"),
+    "action_type": ("policy", "torque", "Torque"),
+    "torque_key": ("applied_torque", "computed_torque"),
+    "ode_solver": ("euler", "rk4"),
+    "wandb_mode": ("online", "offline", "disabled"),
+    "eval_split": ("all", "train", "val"),
+}
+FIELD_ALIASES = {
+    "object_hidden_dim": ("object_mlp_hidden_dim",),
+    "object_depth": ("object_mlp_depth",),
+}
 
 
 @dataclass
@@ -42,11 +59,13 @@ class TrainConfig:
     dataset_dir: str
     dataset_file: str | None
     model_type: str
+    rwm_config: str | None
     history_len: int
     rollout_horizon: int
     robot_dof: int
     action_dim: int
     torque_dim: int
+    action_type: str
     torque_key: str
     hidden_dim: int
     object_hidden_dim: int
@@ -113,6 +132,24 @@ class TrainConfig:
     eval_max_frames: int
 
 
+@dataclass
+class RWMConfig:
+    architecture: str = "RNN"
+    cell: str = "GRU"
+    ensemble_size: int = 5
+    history_horizon: int = 32
+    forecast_horizon: int = 8
+    rnn_num_layers: int = 2
+    rnn_hidden_size: int = 256
+    state_mean_head: list[int] = field(default_factory=lambda: [128])
+    state_logstd_head: list[int] | None = field(default_factory=lambda: [128])
+    state_loss_weight: float = 1.0
+    sequence_loss_weight: float = 1.0
+    bound_loss_weight: float = 0.01
+    kl_loss_weight: float = 1.0
+    bootstrap: bool = False
+
+
 def _load_config_file(path: str) -> dict[str, Any]:
     if yaml is None:
         raise ImportError("PyYAML is required for TrainConfig YAML. Install it with `pip install pyyaml`.")
@@ -130,11 +167,50 @@ def _load_config_file(path: str) -> dict[str, Any]:
     if unknown:
         joined = ", ".join(unknown)
         raise ValueError(f"Unknown train config key(s) in {config_path}: {joined}")
-    for key in ("dataset_dir", "dataset_file", "output_dir"):
+    for key in ("dataset_dir", "dataset_file", "output_dir", "rwm_config"):
         value = values.get(key)
         if isinstance(value, str) and value and not os.path.isabs(value):
             values[key] = str((config_path.parent / value).resolve())
     return values
+
+
+def load_rwm_config(path: str | None) -> RWMConfig:
+    if yaml is None:
+        raise ImportError("PyYAML is required for RWMConfig YAML. Install it with `pip install pyyaml`.")
+
+    config_path = Path(path).expanduser() if path else DEFAULT_RWM_CONFIG_PATH
+    if not config_path.is_file():
+        raise FileNotFoundError(f"RWM config YAML not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Expected a YAML mapping in {config_path}, got {type(loaded).__name__}.")
+
+    valid_keys = {field.name for field in fields(RWMConfig)}
+    unknown = sorted(set(loaded) - valid_keys)
+    if unknown:
+        joined = ", ".join(unknown)
+        raise ValueError(f"Unknown RWM config key(s) in {config_path}: {joined}")
+
+    values = asdict(RWMConfig()) | loaded
+    cfg = RWMConfig(**values)
+    _validate_rwm_config(cfg, config_path)
+    return cfg
+
+
+def _validate_rwm_config(cfg: RWMConfig, path: Path) -> None:
+    if cfg.architecture.strip().lower() != "rnn":
+        raise ValueError(f"{path}: only architecture: RNN is currently wired for training.")
+    if cfg.cell.strip().lower() not in {"gru", "lstm"}:
+        raise ValueError(f"{path}: cell must be GRU or LSTM.")
+    if cfg.ensemble_size < 1:
+        raise ValueError(f"{path}: ensemble_size must be >= 1.")
+    if cfg.history_horizon < 1 or cfg.forecast_horizon < 1:
+        raise ValueError(f"{path}: history_horizon and forecast_horizon must be >= 1.")
+    if not cfg.state_mean_head:
+        raise ValueError(f"{path}: state_mean_head must contain at least one hidden size.")
+    if cfg.state_logstd_head is not None and not cfg.state_logstd_head:
+        raise ValueError(f"{path}: state_logstd_head must be null or contain at least one hidden size.")
 
 
 def _require_config_keys(values: dict[str, Any], path: str | Path) -> None:
@@ -160,119 +236,109 @@ def _defaults_from_config(argv: list[str] | None) -> tuple[dict[str, Any], str |
     return defaults, config_path
 
 
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in TRUE_STRINGS:
+        return True
+    if normalized in FALSE_STRINGS:
+        return False
+    expected = ", ".join(sorted(TRUE_STRINGS | FALSE_STRINGS))
+    raise argparse.ArgumentTypeError(f"expected a boolean value ({expected}), got {value!r}")
+
+
+def _allows_none(annotation: Any) -> bool:
+    return type(None) in get_args(annotation)
+
+
+def _without_none(annotation: Any) -> Any:
+    all_args = get_args(annotation)
+    if not all_args:
+        return annotation
+    args = tuple(arg for arg in all_args if arg is not type(None))
+    if not args:
+        return str
+    if len(args) == 1:
+        return args[0]
+    return annotation
+
+
+def _value_parser(name: str, annotation: Any):
+    allow_none = _allows_none(annotation)
+    value_type = _without_none(annotation) if allow_none else annotation
+    origin = get_origin(value_type)
+    if origin is not None:
+        value_type = origin
+
+    if value_type is bool:
+        parser = _parse_bool
+    elif value_type is int:
+        parser = int
+    elif value_type is float:
+        parser = float
+    elif value_type is str:
+        parser = str
+    else:
+        raise TypeError(f"Unsupported TrainConfig field type for {name}: {annotation!r}")
+
+    if not allow_none:
+        return parser
+
+    def parse_optional(value: str) -> Any:
+        if str(value).strip().lower() in NONE_STRINGS:
+            return None
+        return parser(value)
+
+    return parse_optional
+
+
+def _option_strings(name: str, *, negative: bool = False) -> list[str]:
+    option_names = [name, *FIELD_ALIASES.get(name, ())]
+    flags: list[str] = []
+    for option_name in option_names:
+        cli_name = f"no_{option_name}" if negative else option_name
+        flags.append(f"--{cli_name}")
+        hyphen_name = cli_name.replace("_", "-")
+        if hyphen_name != cli_name:
+            flags.append(f"--{hyphen_name}")
+    return flags
+
+
 def _build_parser(defaults: dict[str, Any], config_path: str | None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the DeLaN + object-MLP WMDynamics model.")
     parser.add_argument("--config", type=str, default=config_path, help="Optional YAML file with TrainConfig values.")
-    parser.add_argument("--dataset_dir", type=str, default=defaults["dataset_dir"])
-    parser.add_argument("--dataset_file", type=str, default=defaults["dataset_file"])
-    parser.add_argument("--model_type", type=str, default=defaults["model_type"], choices=("split", "whole"))
-    parser.add_argument("--history_len", type=int, default=defaults["history_len"])
-    parser.add_argument("--rollout_horizon", type=int, default=defaults["rollout_horizon"])
-    parser.add_argument("--robot_dof", type=int, default=defaults["robot_dof"])
-    parser.add_argument("--action_dim", type=int, default=defaults["action_dim"])
-    parser.add_argument("--torque_dim", type=int, default=defaults["torque_dim"])
-    parser.add_argument(
-        "--torque_key",
-        type=str,
-        default=defaults["torque_key"],
-        choices=["applied_torque", "computed_torque"],
-    )
-    parser.add_argument("--hidden_dim", type=int, default=defaults["hidden_dim"])
-    parser.add_argument(
-        "--object_hidden_dim",
-        "--object_mlp_hidden_dim",
-        dest="object_hidden_dim",
-        type=int,
-        default=defaults["object_hidden_dim"],
-    )
-    parser.add_argument(
-        "--object_depth",
-        "--object_mlp_depth",
-        dest="object_depth",
-        type=int,
-        default=defaults["object_depth"],
-    )
-    parser.add_argument("--tool_z_offset", type=float, default=defaults["tool_z_offset"])
-    parser.add_argument("--dt", type=float, default=defaults["dt"])
-    parser.add_argument("--ode_solver", type=str, default=defaults["ode_solver"], choices=("euler", "rk4"))
-    parser.add_argument("--batch_size", type=int, default=defaults["batch_size"])
-    parser.add_argument("--epochs", type=int, default=defaults["epochs"])
-    parser.add_argument("--lr", type=float, default=defaults["lr"])
-    parser.add_argument("--weight_decay", type=float, default=defaults["weight_decay"])
+    overrides = parser.add_argument_group("TrainConfig overrides")
+    type_hints = get_type_hints(TrainConfig)
+    for config_field in fields(TrainConfig):
+        name = config_field.name
+        annotation = type_hints[name]
+        default = defaults[name]
+        kwargs = {
+            "dest": name,
+            "default": default,
+            "help": f"Override TrainConfig.{name} (default: %(default)s).",
+        }
+        if name in FIELD_CHOICES:
+            kwargs["choices"] = FIELD_CHOICES[name]
 
-    rollout = parser.add_argument_group("rollout loss")
-    rollout.add_argument("--q_weight", type=float, default=defaults["q_weight"])
-    rollout.add_argument("--dq_weight", type=float, default=defaults["dq_weight"])
-    rollout.add_argument("--object_pos_weight", type=float, default=defaults["object_pos_weight"])
-    rollout.add_argument("--object_quat_weight", type=float, default=defaults["object_quat_weight"])
-    rollout.add_argument("--object_lin_vel_weight", type=float, default=defaults["object_lin_vel_weight"])
-    rollout.add_argument("--object_ang_vel_weight", type=float, default=defaults["object_ang_vel_weight"])
-
-    context = parser.add_argument_group("context encoder and DeLaN FiLM")
-    context.add_argument("--use_context_encoder", dest="use_context_encoder", action="store_true", default=defaults["use_context_encoder"])
-    context.add_argument("--no_use_context_encoder", dest="use_context_encoder", action="store_false")
-    context.add_argument("--latent_dim", type=int, default=defaults["latent_dim"])
-    context.add_argument("--context_encoder_hidden_dim", type=int, default=defaults["context_encoder_hidden_dim"])
-    context.add_argument("--context_encoder_depth", type=int, default=defaults["context_encoder_depth"])
-    context.add_argument("--delan_use_film", dest="delan_use_film", action="store_true", default=defaults["delan_use_film"])
-    context.add_argument("--no_delan_use_film", dest="delan_use_film", action="store_false")
-    context.add_argument("--delan_film_depth", type=int, default=defaults["delan_film_depth"])
-    context.add_argument("--lambda_context_kl", type=float, default=defaults["lambda_context_kl"])
-
-    train = parser.add_argument_group("training")
-    train.add_argument("--train_split", type=float, default=defaults["train_split"])
-    train.add_argument("--seed", type=int, default=defaults["seed"])
-    train.add_argument("--num_workers", type=int, default=defaults["num_workers"])
-    train.add_argument("--output_dir", type=str, default=defaults["output_dir"])
-    train.add_argument("--run_name", type=str, default=defaults["run_name"])
-    train.add_argument("--log_every_batches", type=int, default=defaults["log_every_batches"])
-    train.add_argument("--train_batch_fraction", type=float, default=defaults["train_batch_fraction"])
-    train.add_argument("--train_subsample_fraction", type=float, default=defaults["train_subsample_fraction"])
-    train.add_argument("--val_subsample_fraction", type=float, default=defaults["val_subsample_fraction"])
-
-    data = parser.add_argument_group("data filtering")
-    data.add_argument("--filter_pre_contact", dest="filter_pre_contact", action="store_true", default=defaults["filter_pre_contact"])
-    data.add_argument("--no_filter_pre_contact", dest="filter_pre_contact", action="store_false")
-    data.add_argument("--object_displacement_threshold", type=float, default=defaults["object_displacement_threshold"])
-    data.add_argument("--object_velocity_threshold", type=float, default=defaults["object_velocity_threshold"])
-    data.add_argument("--contact_consecutive_steps", type=int, default=defaults["contact_consecutive_steps"])
-    data.add_argument("--contact_settle_steps", type=int, default=defaults["contact_settle_steps"])
-    data.add_argument("--subtract_env_origin", dest="subtract_env_origin", action="store_true", default=defaults["subtract_env_origin"])
-    data.add_argument("--no_subtract_env_origin", dest="subtract_env_origin", action="store_false")
-
-    eval_group = parser.add_argument_group("post-training evaluation")
-    eval_group.add_argument("--eval_after_train", dest="eval_after_train", action="store_true", default=defaults["eval_after_train"])
-    eval_group.add_argument("--no_eval_after_train", dest="eval_after_train", action="store_false")
-    eval_group.add_argument("--eval_fail_on_error", dest="eval_fail_on_error", action="store_true", default=defaults["eval_fail_on_error"])
-    eval_group.add_argument("--no_eval_fail_on_error", dest="eval_fail_on_error", action="store_false")
-    eval_group.add_argument("--eval_output_dir", type=str, default=defaults["eval_output_dir"])
-    eval_group.add_argument("--eval_split", type=str, default=defaults["eval_split"], choices=("all", "train", "val"))
-    eval_group.add_argument("--eval_batch_size", type=int, default=defaults["eval_batch_size"])
-    eval_group.add_argument("--eval_max_batches", type=int, default=defaults["eval_max_batches"])
-    eval_group.add_argument("--eval_max_episodes", type=int, default=defaults["eval_max_episodes"])
-    eval_group.add_argument("--eval_num_workers", type=int, default=defaults["eval_num_workers"])
-    eval_group.add_argument("--eval_episode_plot", dest="eval_episode_plot", action="store_true", default=defaults["eval_episode_plot"])
-    eval_group.add_argument("--no_eval_episode_plot", dest="eval_episode_plot", action="store_false")
-    eval_group.add_argument("--eval_episode_index", type=int, default=defaults["eval_episode_index"])
-    eval_group.add_argument("--eval_episode_name", type=str, default=defaults["eval_episode_name"])
-    eval_group.add_argument("--eval_start_t", type=int, default=defaults["eval_start_t"])
-    eval_group.add_argument("--eval_rollout_steps", type=int, default=defaults["eval_rollout_steps"])
-    eval_group.add_argument("--eval_target", type=str, default=defaults["eval_target"])
-    eval_group.add_argument(
-        "--eval_prediction_metrics",
-        dest="eval_prediction_metrics",
-        action="store_true",
-        default=defaults["eval_prediction_metrics"],
-    )
-    eval_group.add_argument("--no_eval_prediction_metrics", dest="eval_prediction_metrics", action="store_false")
-    eval_group.add_argument("--eval_pred_horizon", type=int, default=defaults["eval_pred_horizon"])
-    eval_group.add_argument("--eval_prediction_max_episodes", type=int, default=defaults["eval_prediction_max_episodes"])
-    eval_group.add_argument("--eval_video", dest="eval_video", action="store_true", default=defaults["eval_video"])
-    eval_group.add_argument("--no_eval_video", dest="eval_video", action="store_false")
-    eval_group.add_argument("--eval_fps", type=int, default=defaults["eval_fps"])
-    eval_group.add_argument("--eval_max_frames", type=int, default=defaults["eval_max_frames"])
-
-    add_wandb_args(parser, defaults)
+        if _without_none(annotation) is bool:
+            overrides.add_argument(
+                *_option_strings(name),
+                nargs="?",
+                const=True,
+                type=_parse_bool,
+                metavar="{true,false}",
+                **kwargs,
+            )
+            overrides.add_argument(
+                *_option_strings(name, negative=True),
+                dest=name,
+                action="store_false",
+                help=f"Set TrainConfig.{name}=False.",
+            )
+        else:
+            overrides.add_argument(*_option_strings(name), type=_value_parser(name, annotation), **kwargs)
     return parser
 
 
@@ -282,6 +348,24 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     values = vars(parser.parse_args(argv))
     values.pop("config", None)
     return TrainConfig(**values)
+
+
+def _normalize_action_type(action_type: str) -> str:
+    normalized = action_type.strip().lower()
+    if normalized not in {"policy", "torque"}:
+        raise ValueError(f"action_type must be 'policy' or 'torque', got {action_type!r}.")
+    return normalized
+
+
+def _model_name(cfg: TrainConfig) -> str:
+    return "RWMEnsemble" if cfg.model_type == "rwm" else MODEL_NAME
+
+
+def _apply_rwm_horizons(cfg: TrainConfig, rwm_cfg: RWMConfig | None) -> None:
+    if rwm_cfg is None:
+        return
+    cfg.history_len = rwm_cfg.history_horizon
+    cfg.rollout_horizon = rwm_cfg.forecast_horizon
 
 
 def resolve_hdf5_paths(cfg: TrainConfig) -> list[str]:
@@ -356,6 +440,7 @@ def make_dataloaders(cfg: TrainConfig):
         "n_train_samples": len(train_dataset),
         "n_val_samples": len(val_dataset),
         "torque_key": cfg.torque_key,
+        "action_type": cfg.action_type,
         "train_episodes_with_contact": train_dataset.episodes_with_contact,
         "val_episodes_with_contact": val_dataset.episodes_with_contact,
         "train_skipped_short_episodes": train_dataset.skipped_short_episodes,
@@ -393,7 +478,46 @@ def _max_batches(loader: DataLoader, fraction: float) -> int | None:
     return max(1, int(round(len(loader) * fraction)))
 
 
-def build_model(cfg: TrainConfig) -> torch.nn.Module:
+def _rwm_action_dim(cfg: TrainConfig) -> int:
+    return cfg.action_dim if _normalize_action_type(cfg.action_type) == "policy" else cfg.torque_dim
+
+
+def _rwm_architecture_config(cfg: RWMConfig) -> dict[str, Any]:
+    return {
+        "type": cfg.architecture.strip().lower(),
+        "rnn_type": cfg.cell.strip().lower(),
+        "rnn_num_layers": cfg.rnn_num_layers,
+        "rnn_hidden_size": cfg.rnn_hidden_size,
+        "state_mean_shape": list(cfg.state_mean_head),
+        "state_logstd_shape": None if cfg.state_logstd_head is None else list(cfg.state_logstd_head),
+    }
+
+
+def build_model(
+    cfg: TrainConfig,
+    *,
+    device: torch.device | str | None = None,
+    rwm_cfg: RWMConfig | None = None,
+) -> torch.nn.Module:
+    if cfg.model_type == "rwm":
+        rwm_cfg = rwm_cfg or load_rwm_config(cfg.rwm_config)
+        torch_device = torch.device(device or "cpu")
+        layout = object_mlp_dataset.RobotObjectWMStateLayout(
+            robot_dof=cfg.robot_dof,
+            action_dim=cfg.action_dim,
+            torque_dim=cfg.torque_dim,
+        )
+        model = RWMEnsemble(
+            state_dim=layout.state_dim,
+            action_dim=_rwm_action_dim(cfg),
+            device=str(torch_device),
+            ensemble_size=rwm_cfg.ensemble_size,
+            history_horizon=rwm_cfg.history_horizon,
+            architecture_config=_rwm_architecture_config(rwm_cfg),
+        )
+        model.model_type = "rwm"
+        model.action_type = _normalize_action_type(cfg.action_type)
+        return model
     if cfg.model_type == "whole":
         whole_cfg = WholeWMDynamicsConfig(
             robot_dof=cfg.robot_dof,
@@ -446,6 +570,37 @@ def _forward_model(model, batch, device: torch.device, *, return_context: bool =
     )
 
 
+def _rwm_sequence_batch(
+    batch: dict[str, Any],
+    device: torch.device,
+    cfg: TrainConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    history_states = batch["history_states"].to(device)
+    future_states = batch["future_states"].to(device)
+    state_batch = torch.cat([history_states, future_states], dim=1)
+
+    action_type = _normalize_action_type(cfg.action_type)
+    if action_type == "policy":
+        history_actions = batch["history_actions"].to(device)
+        future_actions = batch["future_actions"].to(device)
+        pad = history_actions.new_zeros(history_actions.shape[0], 1, history_actions.shape[-1])
+        action_batch = torch.cat([pad, history_actions, future_actions], dim=1)
+        action_values = torch.cat([history_actions, future_actions], dim=1)
+    else:
+        history_torques = batch["history_torques"].to(device)
+        future_torques = batch["future_torques"].to(device)
+        pad = history_torques.new_zeros(history_torques.shape[0], 1, history_torques.shape[-1])
+        action_batch = torch.cat([pad, history_torques, future_torques[:, 1:]], dim=1)
+        action_values = torch.cat([history_torques, future_torques[:, 1:]], dim=1)
+
+    if action_batch.shape[1] != state_batch.shape[1]:
+        raise ValueError(
+            "RWM state/action sequence length mismatch: "
+            f"states={state_batch.shape[1]} actions={action_batch.shape[1]}."
+        )
+    return state_batch, action_batch, action_values
+
+
 def _is_finite(tensor: torch.Tensor) -> bool:
     return bool(torch.isfinite(tensor).all().detach().cpu().item())
 
@@ -476,6 +631,84 @@ def _raise_nonfinite_step(phase: str, batch_idx: int, tensors: dict[str, torch.T
     raise FloatingPointError(f"Non-finite value during {phase} batch {batch_idx}:\n  {joined}")
 
 
+def run_rwm_epoch(
+    model: RWMEnsemble,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    device: torch.device,
+    cfg: TrainConfig,
+    rwm_cfg: RWMConfig,
+    max_batches: int | None,
+) -> dict[str, float]:
+    is_train = optimizer is not None
+    model.train(is_train)
+    averager = MetricAverager()
+    num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
+    phase = "train" if is_train else "val"
+
+    for batch_idx, batch in enumerate(loader, start=1):
+        if max_batches is not None and batch_idx > max_batches:
+            break
+
+        state_batch, action_batch, action_values = _rwm_sequence_batch(batch, device, cfg)
+        if hasattr(model, "reset"):
+            model.reset()
+
+        with torch.set_grad_enabled(is_train):
+            state_loss, sequence_loss, bound_loss, kl_loss = model.compute_loss(
+                state_batch,
+                action_batch,
+                bootstrap=rwm_cfg.bootstrap,
+            )
+            loss = (
+                rwm_cfg.state_loss_weight * state_loss
+                + rwm_cfg.sequence_loss_weight * sequence_loss
+                + rwm_cfg.bound_loss_weight * bound_loss
+                + rwm_cfg.kl_loss_weight * kl_loss
+            )
+            if not _is_finite(loss):
+                _raise_nonfinite_step(
+                    phase,
+                    batch_idx,
+                    {
+                        "state_batch": state_batch,
+                        "action_batch": action_batch,
+                        "state_loss": state_loss,
+                        "sequence_loss": sequence_loss,
+                        "bound_loss": bound_loss,
+                        "kl_loss": kl_loss,
+                        "loss": loss,
+                    },
+                )
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            if not _is_finite(grad_norm):
+                _raise_nonfinite_step(phase, batch_idx, {"loss": loss, "grad_norm": grad_norm})
+            optimizer.step()
+
+        metrics = {
+            "loss": loss.detach(),
+            "rollout_loss": state_loss.detach(),
+            "rwm_state_loss": state_loss.detach(),
+            "rwm_sequence_loss": sequence_loss.detach(),
+            "rwm_bound_loss": bound_loss.detach(),
+            "rwm_kl_loss": kl_loss.detach(),
+            "action_abs_mean": action_values.abs().mean().detach(),
+        }
+        averager.update(metrics)
+        averager.step()
+
+        if cfg.log_every_batches > 0 and batch_idx % cfg.log_every_batches == 0:
+            print(f"  [{phase}] batch {batch_idx}/{num_batches} loss={loss.item():.6f}")
+
+    if hasattr(model, "reset"):
+        model.reset()
+    return averager.means()
+
+
 def run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -483,7 +716,13 @@ def run_epoch(
     device: torch.device,
     cfg: TrainConfig,
     max_batches: int | None,
+    rwm_cfg: RWMConfig | None = None,
 ) -> dict[str, float]:
+    if cfg.model_type == "rwm":
+        if rwm_cfg is None:
+            raise ValueError("rwm_cfg is required when model_type='rwm'.")
+        return run_rwm_epoch(model, loader, optimizer, device, cfg, rwm_cfg, max_batches)
+
     is_train = optimizer is not None
     model.train(is_train)
     averager = MetricAverager()
@@ -598,11 +837,23 @@ def _step_metrics(
     return metrics
 
 
-def _print_run_header(cfg: TrainConfig, device: torch.device, output_dir: str, meta: dict[str, Any]) -> None:
+def _print_run_header(
+    cfg: TrainConfig,
+    device: torch.device,
+    output_dir: str,
+    meta: dict[str, Any],
+    *,
+    model_name: str = MODEL_NAME,
+    rwm_cfg: RWMConfig | None = None,
+) -> None:
     print("Training config:")
     for key, value in asdict(cfg).items():
         print(f"  {key}: {value}")
-    print(f"Model: {MODEL_NAME}")
+    if rwm_cfg is not None:
+        print("RWM config:")
+        for key, value in asdict(rwm_cfg).items():
+            print(f"  {key}: {value}")
+    print(f"Model: {model_name}")
     print(f"Device: {device}")
     print(f"Output dir: {output_dir}")
     print("Dataset meta:")
@@ -750,23 +1001,31 @@ def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     cfg = parse_args(argv)
+    cfg.action_type = _normalize_action_type(cfg.action_type)
+    rwm_cfg = load_rwm_config(cfg.rwm_config) if cfg.model_type == "rwm" else None
+    _apply_rwm_horizons(cfg, rwm_cfg)
+    model_name = _model_name(cfg)
+    run_config = asdict(cfg)
+    if rwm_cfg is not None:
+        run_config["rwm_config_values"] = asdict(rwm_cfg)
+
     set_seed(cfg.seed)
-    run = start_training_run(cfg, MODEL_NAME, asdict(cfg))
+    run = start_training_run(cfg, model_name, run_config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, val_loader, layout, meta = make_dataloaders(cfg)
-    model = build_model(cfg).to(device)
+    model = build_model(cfg, device=device, rwm_cfg=rwm_cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    _print_run_header(cfg, device, run.output_dir, meta)
-    run.update_config({"architecture": MODEL_NAME, "data_meta": meta})
+    _print_run_header(cfg, device, run.output_dir, meta, model_name=model_name, rwm_cfg=rwm_cfg)
+    run.update_config({"architecture": model_name, "data_meta": meta})
 
     best_val = float("inf")
     max_train_batches = _max_batches(train_loader, cfg.train_batch_fraction)
 
     try:
         for epoch in range(1, cfg.epochs + 1):
-            train_metrics = run_epoch(model, train_loader, optimizer, device, cfg, max_train_batches)
-            val_metrics = run_epoch(model, val_loader, None, device, cfg, None)
+            train_metrics = run_epoch(model, train_loader, optimizer, device, cfg, max_train_batches, rwm_cfg)
+            val_metrics = run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg)
             print(
                 f"[Epoch {epoch:03d}] "
                 f"train_loss={train_metrics['loss']:.6f} val_loss={val_metrics['loss']:.6f} "
@@ -779,8 +1038,9 @@ def main(argv: list[str] | None = None) -> None:
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch,
-                    "architecture": MODEL_NAME,
+                    "architecture": model_name,
                     "config": asdict(cfg),
+                    "rwm_config": asdict(rwm_cfg) if rwm_cfg is not None else None,
                     "layout": layout.to_dict(),
                     "data_meta": meta,
                     "train_metrics": train_metrics,

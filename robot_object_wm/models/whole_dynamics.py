@@ -212,7 +212,10 @@ class WholeDeLaNWMDynamics(nn.Module):
     ) -> tuple[torch.Tensor, DelanTerms]:
         terms = self.core(q_whole, dq_whole, z=z if self.delan_use_film else None)
         rhs = generalized_force - terms.g - terms.coriolis
-        return safe_solve(terms.H, rhs), terms
+        ddq = safe_solve(terms.H, rhs)
+        ddq = torch.nan_to_num(ddq, nan=0.0, posinf=1e3, neginf=-1e3)
+        ddq = ddq.clamp(-1e3, 1e3)
+        return ddq, terms
 
     def state_derivative(
         self,

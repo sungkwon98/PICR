@@ -5,13 +5,16 @@ dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_con
 
 # split: robot DeLaN + object MLP
 # whole: one DeLaN over robot + object generalized coordinates
-model_type: whole
+# rwm: RWMEnsemble whole-dynamics model configured by rwm_config.yaml
+model_type: rwm
+rwm_config: rwm_config.yaml
 
-history_len: 5
-rollout_horizon: 3
+history_len: 32
+rollout_horizon: 8
 robot_dof: 9
 action_dim: 8
 torque_dim: 9
+action_type: torque  # policy or torque
 torque_key: applied_torque
 
 hidden_dim: 256
@@ -19,7 +22,7 @@ object_hidden_dim: 256
 object_depth: 3
 tool_z_offset: 0.1034
 dt: 0.02
-ode_solver: rk4  # euler or rk4
+ode_solver: euler  # euler or rk4
 
 batch_size: 256
 epochs: 200
@@ -36,11 +39,11 @@ object_ang_vel_weight: 1.
 # Latent context encoder and DeLaN FiLM.
 # z = encoder(history_states, history_torques)
 # If delan_use_film is true, z modulates DeLaN H/g/L heads.
-use_context_encoder: true
+use_context_encoder: false
 latent_dim: 8
 context_encoder_hidden_dim: 256
 context_encoder_depth: 2
-delan_use_film: true
+delan_use_film: false
 delan_film_depth: 2
 lambda_context_kl: 1.0e-4
 

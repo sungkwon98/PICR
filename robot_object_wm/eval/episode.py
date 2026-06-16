@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from robot_object_wm.data.dataset import h5_open
+from robot_object_wm.models.rwm import RWMEnsemble
 from robot_object_wm.models.utils import FrankaForwardKinematics
 
 
@@ -15,6 +16,7 @@ from robot_object_wm.models.utils import FrankaForwardKinematics
 class EpisodeData:
     name: str
     state: np.ndarray
+    action: np.ndarray
     torque: np.ndarray
     object_context: np.ndarray
     joint_pos_abs: np.ndarray
@@ -67,6 +69,7 @@ def load_episode_data(
     episode_index: int = 0,
     episode_name: str | None = None,
     robot_dof: int = 9,
+    action_dim: int = 8,
     torque_dim: int = 9,
     torque_key: str = "applied_torque",
     subtract_env_origin: bool = True,
@@ -85,6 +88,7 @@ def load_episode_data(
 
         joint_pos_rel = np.asarray(obs["joint_pos"], dtype=np.float32)[:, :robot_dof]
         joint_vel = np.asarray(obs["joint_vel"], dtype=np.float32)[:, :robot_dof]
+        actions = np.asarray(episode["actions"], dtype=np.float32)[:, :action_dim]
         torques = np.asarray(episode["robot_torques"][torque_key], dtype=np.float32)[:, :torque_dim]
 
         try:
@@ -123,6 +127,7 @@ def load_episode_data(
     T = min(
         joint_pos_rel.shape[0],
         joint_vel.shape[0],
+        actions.shape[0],
         torques.shape[0],
         joint_pos_abs.shape[0],
         object_pos.shape[0],
@@ -152,6 +157,7 @@ def load_episode_data(
     return EpisodeData(
         name=resolved_name,
         state=state,
+        action=actions[:T].astype(np.float32),
         torque=torques[:T].astype(np.float32),
         object_context=object_context,
         joint_pos_abs=joint_pos_abs[:T].astype(np.float32),
@@ -179,6 +185,16 @@ def rollout_episode(
     if rollout_steps <= 0:
         raise ValueError(f"No rollout room: start_t={start_t}, T={episode.T}.")
 
+    if isinstance(model, RWMEnsemble) or getattr(model, "model_type", None) == "rwm":
+        return _rollout_rwm_episode(
+            model,
+            episode,
+            start_t=start_t,
+            rollout_steps=rollout_steps,
+            history_len=history_len,
+            device=device,
+        )
+
     history_states = torch.from_numpy(episode.state[start_t - history_len + 1 : start_t + 1][None]).to(device)
     history_torques = torch.from_numpy(episode.torque[start_t - history_len + 1 : start_t + 1][None]).to(device)
     future_torques = torch.from_numpy(episode.torque[start_t : start_t + rollout_steps][None]).to(device)
@@ -200,6 +216,89 @@ def rollout_episode(
             failed_step = 0
             failure_reason = f"model rollout failed: {exc}"
 
+    pred_np = pred.detach().cpu().numpy()[0].astype(np.float32)
+    if pred_np.size > 0:
+        finite_by_step = np.isfinite(pred_np).reshape(pred_np.shape[0], -1).all(axis=1)
+        if not bool(finite_by_step.all()):
+            first_bad = int(np.flatnonzero(~finite_by_step)[0])
+            pred_np = pred_np[:first_bad]
+            failed_step = first_bad
+            failure_reason = "non-finite predicted state"
+
+    gt_states = episode.state[start_t + 1 : start_t + 1 + pred_np.shape[0]]
+    return EpisodeRollout(
+        pred_states=pred_np,
+        gt_states=gt_states.astype(np.float32),
+        start_t=start_t,
+        failed_step=failed_step,
+        failure_reason=failure_reason,
+    )
+
+
+def _rwm_episode_action_windows(
+    model: torch.nn.Module,
+    episode: EpisodeData,
+    *,
+    start_t: int,
+    rollout_steps: int,
+    history_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    action_type = str(getattr(model, "action_type", "torque")).strip().lower()
+    if action_type == "policy":
+        values = episode.action
+    elif action_type == "torque":
+        values = episode.torque
+    else:
+        raise ValueError(f"RWM action_type must be 'policy' or 'torque', got {action_type!r}.")
+    history = torch.from_numpy(values[start_t - history_len + 1 : start_t + 1][None]).to(device)
+    future = torch.from_numpy(values[start_t : start_t + rollout_steps][None]).to(device)
+    return history, future
+
+
+def _rollout_rwm_episode(
+    model: torch.nn.Module,
+    episode: EpisodeData,
+    *,
+    start_t: int,
+    rollout_steps: int,
+    history_len: int,
+    device: torch.device,
+) -> EpisodeRollout:
+    history_states = torch.from_numpy(episode.state[start_t - history_len + 1 : start_t + 1][None]).to(device)
+    history_actions, future_actions = _rwm_episode_action_windows(
+        model,
+        episode,
+        start_t=start_t,
+        rollout_steps=rollout_steps,
+        history_len=history_len,
+        device=device,
+    )
+
+    failed_step = None
+    failure_reason = None
+    pred_steps: list[torch.Tensor] = []
+    with torch.inference_mode():
+        try:
+            if hasattr(model, "reset"):
+                model.reset()
+            x_state = history_states
+            for step in range(rollout_steps):
+                x_action = history_actions if step == 0 else future_actions[:, step : step + 1]
+                pred_state, _aleatoric, _epistemic = model(x_state, x_action)
+                pred_steps.append(pred_state)
+                x_state = pred_state.unsqueeze(1)
+        except RuntimeError as exc:
+            failed_step = len(pred_steps)
+            failure_reason = f"model rollout failed: {exc}"
+        finally:
+            if hasattr(model, "reset"):
+                model.reset()
+
+    if pred_steps:
+        pred = torch.stack(pred_steps, dim=1)
+    else:
+        pred = history_states.new_empty((1, 0, episode.state.shape[-1]))
     pred_np = pred.detach().cpu().numpy()[0].astype(np.float32)
     if pred_np.size > 0:
         finite_by_step = np.isfinite(pred_np).reshape(pred_np.shape[0], -1).all(axis=1)
@@ -438,6 +537,7 @@ def load_episodes(
     *,
     max_episodes: int = 0,
     robot_dof: int = 9,
+    action_dim: int = 8,
     torque_dim: int = 9,
     torque_key: str = "applied_torque",
     subtract_env_origin: bool = True,
@@ -451,6 +551,7 @@ def load_episodes(
             dataset_file,
             episode_name=name,
             robot_dof=robot_dof,
+            action_dim=action_dim,
             torque_dim=torque_dim,
             torque_key=torque_key,
             subtract_env_origin=subtract_env_origin,

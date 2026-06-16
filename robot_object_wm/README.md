@@ -38,21 +38,21 @@ Command-line flags override YAML values, so quick experiments can stay small:
 
 ```bash
 python training/train.py --config configs/train_config.yaml \
-  --epochs 50 \
-  --wandb-mode disabled
+  --epochs=50 \
+  --wandb_mode=disabled
 ```
 
-Useful flags:
+Every key in `configs/train_config.yaml` is editable from the command line.
+Both underscore and hyphen spellings are accepted, and booleans accept explicit
+values:
 
 ```bash
---history_len 5
---rollout_horizon 3
---hidden_dim 256
---object_hidden_dim 256
---object_depth 3
---use_context_encoder
---delan_use_film
---wandb-mode disabled
+python training/train.py \
+  --use_context_encoder=False \
+  --delan_use_film=False \
+  --model_type=split \
+  --rollout_horizon=3 \
+  --eval_video=False
 ```
 
 Each run writes:
@@ -73,8 +73,8 @@ The post-training evaluation is controlled by the `eval_*` keys in
 
 ```bash
 python training/train.py --config configs/train_config.yaml \
-  --no_eval_video \
-  --no_eval_prediction_metrics
+  --eval_video=False \
+  --eval_prediction_metrics=False
 ```
 
 ## Active Model
