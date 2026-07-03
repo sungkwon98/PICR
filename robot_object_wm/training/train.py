@@ -20,15 +20,19 @@ try:
 except ImportError:  # pragma: no cover - depends on the training environment.
     yaml = None
 
-from robot_object_wm.data import object_mlp_dataset
+from robot_object_wm.data import rollout_dataset
+from robot_object_wm.models.context import context_info_nce_loss, context_kl_loss
 from robot_object_wm.models.world_model import (
     WMDynamicsConfig,
     build_wm_dynamics,
-    context_kl_loss,
     weighted_rollout_mse,
 )
 from robot_object_wm.models.rwm import RWMEnsemble
-from robot_object_wm.models.whole_dynamics import WholeWMDynamicsConfig, build_whole_wm_dynamics
+from robot_object_wm.models.whole_dynamics import (
+    WholeWMDynamicsConfig,
+    build_whole_mlp_wm_dynamics,
+    build_whole_wm_dynamics,
+)
 from robot_object_wm.training.checkpoint import checkpoint_and_log_epoch, start_training_run
 from robot_object_wm.training.losses import MetricAverager
 from robot_object_wm.training.helper import set_seed
@@ -41,9 +45,10 @@ NONE_STRINGS = {"", "none", "null", "nil"}
 TRUE_STRINGS = {"1", "true", "t", "yes", "y", "on"}
 FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
 FIELD_CHOICES = {
-    "model_type": ("split", "whole", "rwm"),
+    "model_type": ("split", "whole", "MLP", "mlp", "rwm"),
     "action_type": ("policy", "torque", "Torque"),
     "torque_key": ("applied_torque", "computed_torque"),
+    "privileged_collision_observation": (0, 1, 2, 3),
     "ode_solver": ("euler", "rk4"),
     "wandb_mode": ("online", "offline", "disabled"),
     "eval_split": ("all", "train", "val"),
@@ -67,6 +72,10 @@ class TrainConfig:
     torque_dim: int
     action_type: str
     torque_key: str
+    privileged_collision_observation: int
+    privileged_collision_group: str
+    privileged_collision_pairs: str
+    privileged_collision_loss_weight: float
     hidden_dim: int
     object_hidden_dim: int
     object_depth: int
@@ -89,7 +98,13 @@ class TrainConfig:
     context_encoder_depth: int
     delan_use_film: bool
     delan_film_depth: int
+    delan_use_history: bool
     lambda_context_kl: float
+    use_context_info_nce: bool
+    lambda_context_info_nce: float
+    context_info_nce_temperature: float
+    context_info_nce_similarity_sigma: float
+    context_info_nce_negative_weight: float
     train_split: float
     seed: int
     num_workers: int
@@ -130,6 +145,9 @@ class TrainConfig:
     eval_video: bool
     eval_fps: int
     eval_max_frames: int
+    eval_collision_info: bool
+    eval_collision_group: str
+    eval_collision_dataset_file: str | None
 
 
 @dataclass
@@ -167,7 +185,7 @@ def _load_config_file(path: str) -> dict[str, Any]:
     if unknown:
         joined = ", ".join(unknown)
         raise ValueError(f"Unknown train config key(s) in {config_path}: {joined}")
-    for key in ("dataset_dir", "dataset_file", "output_dir", "rwm_config"):
+    for key in ("dataset_dir", "dataset_file", "output_dir", "rwm_config", "eval_collision_dataset_file"):
         value = values.get(key)
         if isinstance(value, str) and value and not os.path.isabs(value):
             values[key] = str((config_path.parent / value).resolve())
@@ -357,8 +375,40 @@ def _normalize_action_type(action_type: str) -> str:
     return normalized
 
 
+def _normalize_model_type(model_type: str) -> str:
+    normalized = model_type.strip().lower()
+    if normalized not in {"split", "whole", "mlp", "rwm"}:
+        raise ValueError(f"Unknown model_type: {model_type}")
+    return normalized
+
+
 def _model_name(cfg: TrainConfig) -> str:
-    return "RWMEnsemble" if cfg.model_type == "rwm" else MODEL_NAME
+    return "RWMEnsemble" if _normalize_model_type(cfg.model_type) == "rwm" else MODEL_NAME
+
+
+def _privileged_collision_pairs(cfg: TrainConfig) -> tuple[str, ...]:
+    return rollout_dataset.parse_privileged_collision_pairs(cfg.privileged_collision_pairs)
+
+
+def _privileged_collision_obs_dim(cfg: TrainConfig) -> int:
+    return rollout_dataset.privileged_collision_observation_dim(
+        int(cfg.privileged_collision_observation),
+        len(_privileged_collision_pairs(cfg)),
+    )
+
+
+def _state_layout(cfg: TrainConfig) -> rollout_dataset.RobotObjectWMStateLayout:
+    return rollout_dataset.RobotObjectWMStateLayout(
+        robot_dof=cfg.robot_dof,
+        action_dim=cfg.action_dim,
+        torque_dim=cfg.torque_dim,
+        privileged_collision_obs_dim=_privileged_collision_obs_dim(cfg),
+    )
+
+
+def _validate_privileged_collision_model_support(cfg: TrainConfig) -> None:
+    _state_layout(cfg)
+    _normalize_model_type(cfg.model_type)
 
 
 def _apply_rwm_horizons(cfg: TrainConfig, rwm_cfg: RWMConfig | None) -> None:
@@ -377,7 +427,7 @@ def resolve_hdf5_paths(cfg: TrainConfig) -> list[str]:
     dataset_dir = os.path.abspath(cfg.dataset_dir)
     if not os.path.isdir(dataset_dir):
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
-    paths = object_mlp_dataset.discover_hdf5_files(dataset_dir)
+    paths = rollout_dataset.discover_hdf5_files(dataset_dir)
     if not paths:
         raise FileNotFoundError(f"No *.hdf5 files found in {dataset_dir}")
     return paths
@@ -395,18 +445,15 @@ def _subsample_refs(refs: list[Any], fraction: float, seed: int, kind: str) -> l
 
 
 def make_dataloaders(cfg: TrainConfig):
+    _validate_privileged_collision_model_support(cfg)
     hdf5_paths = resolve_hdf5_paths(cfg)
-    episode_refs = object_mlp_dataset.load_all_episode_refs(hdf5_paths)
-    train_refs, val_refs = object_mlp_dataset.split_episode_refs(episode_refs, cfg.train_split, cfg.seed)
+    episode_refs = rollout_dataset.load_all_episode_refs(hdf5_paths)
+    train_refs, val_refs = rollout_dataset.split_episode_refs(episode_refs, cfg.train_split, cfg.seed)
     n_train_before, n_val_before = len(train_refs), len(val_refs)
     train_refs = _subsample_refs(train_refs, cfg.train_subsample_fraction, cfg.seed + 1, "train")
     val_refs = _subsample_refs(val_refs, cfg.val_subsample_fraction, cfg.seed + 2, "val")
 
-    layout = object_mlp_dataset.RobotObjectWMStateLayout(
-        robot_dof=cfg.robot_dof,
-        action_dim=cfg.action_dim,
-        torque_dim=cfg.torque_dim,
-    )
+    layout = _state_layout(cfg)
     dataset_kwargs = {
         "history_len": cfg.history_len,
         "rollout_horizon": cfg.rollout_horizon,
@@ -419,12 +466,15 @@ def make_dataloaders(cfg: TrainConfig):
         "contact_settle_steps": cfg.contact_settle_steps,
         "subtract_env_origin": cfg.subtract_env_origin,
         "layout": layout,
+        "privileged_collision_observation": cfg.privileged_collision_observation,
+        "privileged_collision_group": cfg.privileged_collision_group,
+        "privileged_collision_pairs": cfg.privileged_collision_pairs,
     }
-    train_dataset = object_mlp_dataset.RobotObjectWMRolloutDataset(
+    train_dataset = rollout_dataset.RobotObjectWMRolloutDataset(
         episode_refs=train_refs,
         **dataset_kwargs,
     )
-    val_dataset = object_mlp_dataset.RobotObjectWMRolloutDataset(
+    val_dataset = rollout_dataset.RobotObjectWMRolloutDataset(
         episode_refs=val_refs,
         **dataset_kwargs,
     )
@@ -441,6 +491,11 @@ def make_dataloaders(cfg: TrainConfig):
         "n_val_samples": len(val_dataset),
         "torque_key": cfg.torque_key,
         "action_type": cfg.action_type,
+        "privileged_collision_observation": cfg.privileged_collision_observation,
+        "privileged_collision_group": cfg.privileged_collision_group,
+        "privileged_collision_pairs": list(_privileged_collision_pairs(cfg)),
+        "privileged_collision_obs_dim": layout.privileged_collision_obs_dim,
+        "state_dim": layout.state_dim,
         "train_episodes_with_contact": train_dataset.episodes_with_contact,
         "val_episodes_with_contact": val_dataset.episodes_with_contact,
         "train_skipped_short_episodes": train_dataset.skipped_short_episodes,
@@ -499,14 +554,12 @@ def build_model(
     device: torch.device | str | None = None,
     rwm_cfg: RWMConfig | None = None,
 ) -> torch.nn.Module:
-    if cfg.model_type == "rwm":
+    model_type = _normalize_model_type(cfg.model_type)
+    layout = _state_layout(cfg)
+    _validate_privileged_collision_model_support(cfg)
+    if model_type == "rwm":
         rwm_cfg = rwm_cfg or load_rwm_config(cfg.rwm_config)
         torch_device = torch.device(device or "cpu")
-        layout = object_mlp_dataset.RobotObjectWMStateLayout(
-            robot_dof=cfg.robot_dof,
-            action_dim=cfg.action_dim,
-            torque_dim=cfg.torque_dim,
-        )
         model = RWMEnsemble(
             state_dim=layout.state_dim,
             action_dim=_rwm_action_dim(cfg),
@@ -518,7 +571,7 @@ def build_model(
         model.model_type = "rwm"
         model.action_type = _normalize_action_type(cfg.action_type)
         return model
-    if cfg.model_type == "whole":
+    if model_type in {"whole", "mlp"}:
         whole_cfg = WholeWMDynamicsConfig(
             robot_dof=cfg.robot_dof,
             torque_dim=cfg.torque_dim,
@@ -532,10 +585,13 @@ def build_model(
             context_encoder_depth=cfg.context_encoder_depth,
             delan_use_film=cfg.delan_use_film,
             delan_film_depth=cfg.delan_film_depth,
+            delan_use_history=cfg.delan_use_history,
+            mlp_depth=cfg.object_depth,
+            privileged_collision_obs_dim=layout.privileged_collision_obs_dim,
         )
+        if model_type == "mlp":
+            return build_whole_mlp_wm_dynamics(whole_cfg)
         return build_whole_wm_dynamics(whole_cfg)
-    if cfg.model_type != "split":
-        raise ValueError(f"Unknown model_type: {cfg.model_type}")
     model_cfg = WMDynamicsConfig(
         robot_dof=cfg.robot_dof,
         torque_dim=cfg.torque_dim,
@@ -552,6 +608,8 @@ def build_model(
         context_encoder_depth=cfg.context_encoder_depth,
         delan_use_film=cfg.delan_use_film,
         delan_film_depth=cfg.delan_film_depth,
+        delan_use_history=cfg.delan_use_history,
+        privileged_collision_obs_dim=layout.privileged_collision_obs_dim,
     )
     return build_wm_dynamics(model_cfg)
 
@@ -718,7 +776,7 @@ def run_epoch(
     max_batches: int | None,
     rwm_cfg: RWMConfig | None = None,
 ) -> dict[str, float]:
-    if cfg.model_type == "rwm":
+    if _normalize_model_type(cfg.model_type) == "rwm":
         if rwm_cfg is None:
             raise ValueError("rwm_cfg is required when model_type='rwm'.")
         return run_rwm_epoch(model, loader, optimizer, device, cfg, rwm_cfg, max_batches)
@@ -752,9 +810,23 @@ def run_epoch(
                 object_quat_weight=cfg.object_quat_weight,
                 object_lin_vel_weight=cfg.object_lin_vel_weight,
                 object_ang_vel_weight=cfg.object_ang_vel_weight,
+                privileged_collision_weight=cfg.privileged_collision_loss_weight,
             )
             if context is not None:
                 context_loss, context_metrics = context_kl_loss(context, cfg.lambda_context_kl)
+                context_metrics["context_kl_loss"] = context_loss.detach()
+                if cfg.use_context_info_nce:
+                    info_nce_loss, info_nce_metrics = context_info_nce_loss(
+                        context,
+                        batch["object_context"].to(device),
+                        weight=cfg.lambda_context_info_nce,
+                        temperature=cfg.context_info_nce_temperature,
+                        context_similarity_sigma=cfg.context_info_nce_similarity_sigma,
+                        nce_negative_weight=cfg.context_info_nce_negative_weight,
+                    )
+                    context_loss = context_loss + info_nce_loss
+                    context_metrics.update(info_nce_metrics)
+                    context_metrics["context_info_nce_loss"] = info_nce_loss.detach()
             else:
                 context_loss = rollout_loss.new_zeros(())
                 context_metrics = {}
@@ -795,7 +867,7 @@ def run_epoch(
         metrics.update(rollout_metrics)
         if context_metrics:
             metrics.update(context_metrics)
-            metrics["context_kl_loss"] = context_loss.detach()
+            metrics["context_loss"] = context_loss.detach()
         averager.update(metrics)
         averager.step()
 
@@ -870,6 +942,23 @@ def _post_training_eval_output_dir(cfg: TrainConfig, run_output_dir: str) -> str
     if os.path.isabs(cfg.eval_output_dir):
         return cfg.eval_output_dir
     return os.path.join(run_output_dir, cfg.eval_output_dir)
+
+
+def _collision_augmented_path(path: str) -> str:
+    source = Path(path)
+    if source.stem.endswith("_collision_augmented"):
+        return str(source)
+    return str(source.with_name(f"{source.stem}_collision_augmented{source.suffix}"))
+
+
+def _eval_collision_dataset_file(cfg: TrainConfig) -> str | None:
+    if cfg.eval_collision_dataset_file:
+        return cfg.eval_collision_dataset_file
+    if cfg.dataset_file:
+        candidate = _collision_augmented_path(cfg.dataset_file)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def _metric_key(value: str) -> str:
@@ -980,6 +1069,13 @@ def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
         argv.append("--prediction_metrics")
     if cfg.eval_video:
         argv.append("--video")
+        if not cfg.eval_collision_info:
+            argv.append("--no_collision_info")
+        else:
+            argv.extend(["--collision_group", cfg.eval_collision_group])
+            collision_dataset_file = _eval_collision_dataset_file(cfg)
+            if collision_dataset_file:
+                argv.extend(["--collision_dataset_file", collision_dataset_file])
 
     print("===== Post-training evaluation =====")
     print(f"Best checkpoint: {run.best_path}")
@@ -1002,7 +1098,12 @@ def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
 def main(argv: list[str] | None = None) -> None:
     cfg = parse_args(argv)
     cfg.action_type = _normalize_action_type(cfg.action_type)
-    rwm_cfg = load_rwm_config(cfg.rwm_config) if cfg.model_type == "rwm" else None
+    model_type = _normalize_model_type(cfg.model_type)
+    if cfg.use_context_info_nce and not cfg.use_context_encoder:
+        raise ValueError("use_context_info_nce=True requires use_context_encoder=True.")
+    if cfg.use_context_info_nce and model_type == "rwm":
+        raise ValueError("use_context_info_nce=True is only supported for split/whole/MLP context encoders.")
+    rwm_cfg = load_rwm_config(cfg.rwm_config) if model_type == "rwm" else None
     _apply_rwm_horizons(cfg, rwm_cfg)
     model_name = _model_name(cfg)
     run_config = asdict(cfg)

@@ -6,7 +6,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .context import ContextEncoder, ContextOutput, kl_divergence_standard_normal, reparameterize
+from .context import (
+    ContextEncoder,
+    ContextOutput,
+    context_info_nce_loss,
+    context_kl_loss,
+    info_nce_soft,
+    reparameterize,
+)
 from .delan import DeLaNRobotDynamics
 from .object_dynamics import ObjectState, ObjectStateMLPDynamics, ObjectStepInput
 
@@ -31,10 +38,12 @@ class WMDynamicsConfig:
     context_encoder_depth: int = 2
     delan_use_film: bool = False
     delan_film_depth: int = 2
+    delan_use_history : bool =False 
+    privileged_collision_obs_dim: int = 0
 
     @property
     def object_state_dim(self) -> int:
-        return 13
+        return 13 + self.privileged_collision_obs_dim
 
     @property
     def state_dim(self) -> int:
@@ -57,10 +66,12 @@ class WMDynamics(nn.Module):
         context_encoder_hidden_dim: int = 256,
         context_encoder_depth: int = 2,
         delan_use_film: bool = False,
+        privileged_collision_obs_dim: int = 0,
     ) -> None:
         super().__init__()
         self.robot_dof = robot_dof
-        self.state_dim = 2 * robot_dof + 13
+        self.privileged_collision_obs_dim = int(privileged_collision_obs_dim)
+        self.state_dim = 2 * robot_dof + 13 + self.privileged_collision_obs_dim
         self.torque_dim = torque_dim
         self.history_len = history_len
         self.use_context_encoder = bool(use_context_encoder)
@@ -132,9 +143,15 @@ class WMDynamics(nn.Module):
                     z=z,
                 )
             )
-            robot_out = self.robot(q=q, dq=dq, torque=torque, z=z)
+            x = torch.cat((history_state_window[:, :-1].flatten(start_dim=1),q), dim=1) 
+            robot_out = self.robot(x=x, dq=dq, torque=torque, z=z)
 
-            state = torch.cat([robot_out.next_q, robot_out.next_dq, object_out.state.as_tensor()], dim=-1)
+            state_parts = [robot_out.next_q, robot_out.next_dq, object_out.state.as_tensor()]
+            if self.privileged_collision_obs_dim > 0:
+                if object_out.privileged_collision is None:
+                    raise RuntimeError("Object dynamics did not return privileged collision state.")
+                state_parts.append(object_out.privileged_collision)
+            state = torch.cat(state_parts, dim=-1)
             predictions.append(state)
             history_state_window = torch.cat([history_state_window[:, 1:], state[:, None]], dim=1)
             history_torque_window = torch.cat([history_torque_window[:, 1:], torque[:, None]], dim=1)
@@ -191,11 +208,14 @@ def build_robot_dynamics(cfg: WMDynamicsConfig) -> RobotDynamics:
         robot_dof=cfg.robot_dof,
         torque_dim=cfg.torque_dim,
         hidden_dim=cfg.hidden_dim,
+        history_len = cfg.history_len,
         dt=cfg.dt,
         ode_solver=cfg.ode_solver,
         latent_dim=cfg.latent_dim if cfg.delan_use_film else None,
         use_film=cfg.delan_use_film,
         film_depth=cfg.delan_film_depth,
+        use_history=cfg.delan_use_history,
+        history_state_dim=cfg.state_dim,
     )
 
 
@@ -224,18 +244,8 @@ def build_wm_dynamics(cfg: WMDynamicsConfig = WMDynamicsConfig()) -> WMDynamics:
         context_encoder_hidden_dim=cfg.context_encoder_hidden_dim,
         context_encoder_depth=cfg.context_encoder_depth,
         delan_use_film=cfg.delan_use_film,
+        privileged_collision_obs_dim=cfg.privileged_collision_obs_dim,
     )
-
-
-def context_kl_loss(context: ContextOutput, weight: float = 0.0) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    if weight <= 0.0 or context.mu is None or context.logvar is None:
-        if context.mu is not None:
-            zero = context.mu.new_zeros(())
-        else:
-            zero = torch.zeros(())
-        return zero, {}
-    kl = kl_divergence_standard_normal(context.mu, context.logvar)
-    return weight * kl, {"context_kl": kl.detach()}
 
 
 def weighted_rollout_mse(
@@ -248,8 +258,10 @@ def weighted_rollout_mse(
     object_quat_weight: float = 0.5,
     object_lin_vel_weight: float = 1.0,
     object_ang_vel_weight: float = 0.5,
+    privileged_collision_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     offset = 2 * robot_dof
+    object_end = offset + 13
     parts = {
         "q_mse": F.mse_loss(pred[..., :robot_dof], target[..., :robot_dof]),
         "dq_mse": F.mse_loss(pred[..., robot_dof:offset], target[..., robot_dof:offset]),
@@ -266,4 +278,7 @@ def weighted_rollout_mse(
         + object_lin_vel_weight * parts["object_lin_vel_mse"]
         + object_ang_vel_weight * parts["object_ang_vel_mse"]
     )
+    if pred.shape[-1] > object_end:
+        parts["privileged_collision_mse"] = F.mse_loss(pred[..., object_end:], target[..., object_end:])
+        loss = loss + privileged_collision_weight * parts["privileged_collision_mse"]
     return loss, parts

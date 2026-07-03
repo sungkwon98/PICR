@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from robot_object_wm.data import rollout_dataset
 from robot_object_wm.data.dataset import h5_open
 from robot_object_wm.models.rwm import RWMEnsemble
 from robot_object_wm.models.utils import FrankaForwardKinematics
@@ -75,6 +76,9 @@ def load_episode_data(
     subtract_env_origin: bool = True,
     max_frames: int = 0,
     dt: float = 0.02,
+    privileged_collision_observation: int = 0,
+    privileged_collision_group: str = "privileged_collision",
+    privileged_collision_pairs: str | None = None,
 ) -> EpisodeData:
     if not os.path.isfile(dataset_file):
         raise FileNotFoundError(f"Dataset file not found: {dataset_file}")
@@ -119,6 +123,13 @@ def load_episode_data(
         else:
             origin = np.zeros(3, dtype=np.float32)
         object_pos = object_pos_w - origin[None, :]
+        collision_obs = rollout_dataset.load_privileged_collision_observation(
+            episode,
+            mode=privileged_collision_observation,
+            group_name=privileged_collision_group,
+            pair_names=privileged_collision_pairs,
+            subtract_origin=origin if subtract_env_origin else None,
+        )
 
         mass = np.asarray(object_dyn_group["mass"], dtype=np.float32).reshape(-1, 1)
         inertia = np.asarray(object_dyn_group["inertia"], dtype=np.float32).reshape(-1, 9)
@@ -138,20 +149,22 @@ def load_episode_data(
         inertia.shape[0],
         material.shape[0],
     )
+    if collision_obs is not None:
+        T = min(T, collision_obs.shape[0])
     if max_frames > 0:
         T = min(T, max_frames)
 
-    state = np.concatenate(
-        [
-            joint_pos_rel[:T],
-            joint_vel[:T],
-            object_pos[:T],
-            object_quat[:T],
-            object_lin_vel[:T],
-            object_ang_vel[:T],
-        ],
-        axis=-1,
-    ).astype(np.float32)
+    state_parts = [
+        joint_pos_rel[:T],
+        joint_vel[:T],
+        object_pos[:T],
+        object_quat[:T],
+        object_lin_vel[:T],
+        object_ang_vel[:T],
+    ]
+    if collision_obs is not None:
+        state_parts.append(collision_obs[:T])
+    state = np.concatenate(state_parts, axis=-1).astype(np.float32)
     object_context = np.concatenate([mass[:T], inertia[:T], material[:T]], axis=-1).astype(np.float32)
 
     return EpisodeData(
@@ -542,6 +555,9 @@ def load_episodes(
     torque_key: str = "applied_torque",
     subtract_env_origin: bool = True,
     dt: float = 0.02,
+    privileged_collision_observation: int = 0,
+    privileged_collision_group: str = "privileged_collision",
+    privileged_collision_pairs: str | None = None,
 ) -> list[EpisodeData]:
     names = list_episode_names(dataset_file)
     if max_episodes > 0:
@@ -556,6 +572,9 @@ def load_episodes(
             torque_key=torque_key,
             subtract_env_origin=subtract_env_origin,
             dt=dt,
+            privileged_collision_observation=privileged_collision_observation,
+            privileged_collision_group=privileged_collision_group,
+            privileged_collision_pairs=privileged_collision_pairs,
         )
         for name in names
     ]

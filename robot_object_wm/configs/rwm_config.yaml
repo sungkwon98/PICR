@@ -1,8 +1,8 @@
 architecture: RNN
 cell: GRU
 ensemble_size: 5
-history_horizon: 32
-forecast_horizon: 8
+history_horizon: 8
+forecast_horizon: 5
 rnn_num_layers: 2
 rnn_hidden_size: 256
 state_mean_head: [128]

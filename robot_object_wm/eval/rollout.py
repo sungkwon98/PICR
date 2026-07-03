@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from robot_object_wm.data import object_mlp_dataset
+from robot_object_wm.data import rollout_dataset
 from robot_object_wm.eval.episode import (
     load_episode_data,
     load_episodes,
@@ -158,11 +158,11 @@ def make_eval_loader(
         dataset_file=dataset_file if dataset_file is not None else cfg.dataset_file,
         dataset_dir=dataset_dir if dataset_dir is not None else cfg.dataset_dir,
     )
-    episode_refs = object_mlp_dataset.load_all_episode_refs(hdf5_paths)
+    episode_refs = rollout_dataset.load_all_episode_refs(hdf5_paths)
     if split == "all":
         refs = episode_refs
     else:
-        train_refs, val_refs = object_mlp_dataset.split_episode_refs(episode_refs, cfg.train_split, cfg.seed)
+        train_refs, val_refs = rollout_dataset.split_episode_refs(episode_refs, cfg.train_split, cfg.seed)
         refs = train_refs if split == "train" else val_refs
     if max_episodes is not None:
         refs = refs[: max(0, max_episodes)]
@@ -342,19 +342,23 @@ def _resolve_hdf5_paths(*, dataset_file: str | None, dataset_dir: str) -> list[s
     root = os.path.abspath(dataset_dir)
     if not os.path.isdir(root):
         raise FileNotFoundError(f"Dataset directory not found: {root}")
-    paths = object_mlp_dataset.discover_hdf5_files(root)
+    paths = rollout_dataset.discover_hdf5_files(root)
     if not paths:
         raise FileNotFoundError(f"No *.hdf5 files found in {root}")
     return paths
 
 
 def _build_eval_dataset(cfg: TrainConfig, refs: list[Any]):
-    layout = object_mlp_dataset.RobotObjectWMStateLayout(
+    layout = rollout_dataset.RobotObjectWMStateLayout(
         robot_dof=cfg.robot_dof,
         action_dim=cfg.action_dim,
         torque_dim=cfg.torque_dim,
+        privileged_collision_obs_dim=rollout_dataset.privileged_collision_observation_dim(
+            int(cfg.privileged_collision_observation),
+            len(rollout_dataset.parse_privileged_collision_pairs(cfg.privileged_collision_pairs)),
+        ),
     )
-    dataset = object_mlp_dataset.RobotObjectWMRolloutDataset(
+    dataset = rollout_dataset.RobotObjectWMRolloutDataset(
         episode_refs=refs,
         history_len=cfg.history_len,
         rollout_horizon=cfg.rollout_horizon,
@@ -367,6 +371,9 @@ def _build_eval_dataset(cfg: TrainConfig, refs: list[Any]):
         contact_settle_steps=cfg.contact_settle_steps,
         subtract_env_origin=cfg.subtract_env_origin,
         layout=layout,
+        privileged_collision_observation=cfg.privileged_collision_observation,
+        privileged_collision_group=cfg.privileged_collision_group,
+        privileged_collision_pairs=cfg.privileged_collision_pairs,
     )
     return layout, dataset
 
@@ -468,6 +475,10 @@ def parse_eval_args(argv: list[str] | None = None):
     video.add_argument("--video_output", type=str, default=None)
     video.add_argument("--fps", type=int, default=25)
     video.add_argument("--max_frames", type=int, default=0)
+    video.add_argument("--collision_info", dest="collision_info", action="store_true", default=True)
+    video.add_argument("--no_collision_info", dest="collision_info", action="store_false")
+    video.add_argument("--collision_group", type=str, default="privileged_collision")
+    video.add_argument("--collision_dataset_file", type=str, default=None)
     return parser.parse_args(argv)
 
 
@@ -521,6 +532,9 @@ def main(argv: list[str] | None = None) -> dict[str, str]:
             max_frames=args.max_frames,
             device=next(loaded.model.parameters()).device,
             target=args.target,
+            show_collision_info=args.collision_info,
+            collision_group=args.collision_group,
+            collision_dataset_file=args.collision_dataset_file,
         )
 
     print("===== WMDynamics Evaluation =====")
@@ -548,6 +562,9 @@ def _write_episode_plot(args, loaded: LoadedWorldModel, dataset_file: str) -> di
         subtract_env_origin=cfg.subtract_env_origin,
         max_frames=args.max_frames,
         dt=cfg.dt,
+        privileged_collision_observation=cfg.privileged_collision_observation,
+        privileged_collision_group=cfg.privileged_collision_group,
+        privileged_collision_pairs=cfg.privileged_collision_pairs,
     )
     start_t = max(cfg.history_len - 1, args.start_t)
     steps = episode.T - start_t - 1 if args.rollout_steps <= 0 else args.rollout_steps
@@ -624,6 +641,9 @@ def _write_prediction_metrics(args, loaded: LoadedWorldModel, dataset_file: str)
         torque_key=cfg.torque_key,
         subtract_env_origin=cfg.subtract_env_origin,
         dt=cfg.dt,
+        privileged_collision_observation=cfg.privileged_collision_observation,
+        privileged_collision_group=cfg.privileged_collision_group,
+        privileged_collision_pairs=cfg.privileged_collision_pairs,
     )
     fk = FrankaForwardKinematics(robot_dof=cfg.robot_dof, tool_z_offset=cfg.tool_z_offset).to(device)
     fk.eval()

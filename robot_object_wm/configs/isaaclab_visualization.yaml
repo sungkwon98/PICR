@@ -1,0 +1,36 @@
+# Headless Isaac Lab GT-vs-world-model visualization.
+#
+# Paths are resolved relative to this config file.
+
+task: Isaac-Lift-Cube-Franka-IK-Abs-v0
+dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
+checkpoint: ../outputs_wm_dynamics/run_20260622_100149/best.pt
+output: ../eval_outputs/isaaclab_gt_vs_wm.mp4
+
+# Episode selection from the dataset.
+episode_index: 26
+episode_name:
+
+# The world model needs history before it can imagine forward. The renderer
+# shows the dataset state at start_t, then the open-loop model rollout.
+start_t: 25
+rollout_steps: 200
+max_frames: 250
+
+# Video and scene.
+fps: 25
+video_width: 1280
+video_height: 720
+env_spacing: 2.0
+warmup_frames: 5
+apply_domain_params: true
+
+# Render guards for open-loop model rollouts. These only affect the imagined
+# robot rendering, not the ground-truth replay or the rollout metrics.
+clamp_imagination_joints: true
+couple_imagination_gripper: true
+use_ground_truth_gripper: false
+
+# Leave these empty for an automatic camera framing both comparison envs.
+camera_eye: [2.8, -3.0, 1.65]
+camera_target:

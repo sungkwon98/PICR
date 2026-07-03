@@ -1,13 +1,18 @@
 # Robot-Object World Model
 
-This package now has one active world-model architecture:
+This package contains robot-object world-model training and evaluation code.
+The current default training config uses a pure MLP whole-state model:
 
 ```text
-RobotDynamics + ObjDynamics = WMDynamics
-DeLaN robot dynamics + object-state MLP = multi-step rollout model
+model_type: MLP
+history_len: 8
+rollout_horizon: 5
+action_type: torque
 ```
 
-The active package exposes a single model path and one trainer/evaluator for that path.
+Other wired model types are `split`, `whole`, and `rwm`, but the privileged
+collision observation described below is currently supported for `MLP` and
+`rwm` only.
 
 ## Layout
 
@@ -34,6 +39,22 @@ Or run from this package directory with the TrainConfig YAML:
 python training/train.py --config configs/train_config.yaml
 ```
 
+The default training file is `configs/train_config.yaml`. Current defaults:
+
+```text
+dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep_collision_augmented.hdf5
+model_type: MLP
+history_len: 8
+rollout_horizon: 5
+privileged_collision_observation: 2
+batch_size: 256
+epochs: 200
+train_batch_fraction: 0.1
+train_subsample_fraction: 0.2
+eval_after_train: true
+eval_video: true
+```
+
 Command-line flags override YAML values, so quick experiments can stay small:
 
 ```bash
@@ -50,7 +71,7 @@ values:
 python training/train.py \
   --use_context_encoder=False \
   --delan_use_film=False \
-  --model_type=split \
+  --model_type=MLP \
   --rollout_horizon=3 \
   --eval_video=False
 ```
@@ -79,7 +100,14 @@ python training/train.py --config configs/train_config.yaml \
 
 ## Active Model
 
-`models/world_model.py` exposes:
+The default `MLP` path uses `WholeMLPWMDynamics` in `models/whole_dynamics.py`.
+It predicts the next full state directly from:
+
+```text
+history_states + current torque -> next state
+```
+
+The split DeLaN/object-MLP path in `models/world_model.py` exposes:
 
 - `RobotDynamics`: alias for `DeLaNRobotDynamics`
 - `ObjDynamics`: alias for `ObjectStateMLPDynamics`
@@ -111,7 +139,7 @@ Object side:
 
 ## Data
 
-`data/object_mlp_dataset.py` builds rollout windows with:
+`data/rollout_dataset.py` builds rollout windows with:
 
 - `history_states`
 - `history_torques`
@@ -119,7 +147,113 @@ Object side:
 - `future_states`
 - `object_context` = mass + inertia + material
 
-The dataset keeps `object_context` for logging/metadata compatibility, but the current pure object MLP uses history, current torque, and latent `z`.
+Base state layout is 31D:
+
+```text
+joint_pos(9) + joint_vel(9) + object_pos(3) + object_quat(4)
++ object_lin_vel(3) + object_ang_vel(3)
+```
+
+`object_context` is 13D:
+
+```text
+mass(1) + inertia(9) + material_properties(3)
+```
+
+The dataset keeps `object_context` for logging/metadata compatibility. The
+current default `MLP` model uses `history_states` and current torque directly.
+
+### Privileged Collision Observation
+
+Collision-augmented HDF5 files contain:
+
+```text
+data/<episode>/privileged_collision/
+  pair_names
+  collision
+  distance
+  signed_distance
+  nearest_points        # optional, present when generated with --nearest_points
+```
+
+The default collision pairs are:
+
+```text
+object_ground
+object_left_finger
+object_right_finger
+object_gripper
+```
+
+Training can append privileged collision information to each state with:
+
+```yaml
+privileged_collision_observation: 2
+privileged_collision_group: privileged_collision
+privileged_collision_pairs: object_ground,object_left_finger,object_right_finger,object_gripper
+privileged_collision_loss_weight: 1.0
+```
+
+Modes:
+
+```text
+0: no privileged collision info
+1: collision flag
+2: signed distance
+3: signed distance + nearest_points
+```
+
+With the default 4 pairs, state size becomes:
+
+```text
+mode 0: 31
+mode 1: 35
+mode 2: 35
+mode 3: 59
+```
+
+Mode 3 is `signed_distance(4) + nearest_points(4 * 2 * 3 = 24)`, so it adds
+28 dims. `nearest_points` NaNs are converted to zeros before training. When
+`subtract_env_origin` is true, nearest points are shifted into the same relative
+coordinate frame as object position.
+
+Collision observation dims are also included in the rollout loss as
+`privileged_collision_mse`, weighted by `privileged_collision_loss_weight`.
+This matters because rollout feeds predicted states back into the next step.
+
+Example using signed distance:
+
+```bash
+python training/train.py --config configs/train_config.yaml \
+  --dataset_file ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_light_context_10ep_collision_augmented.hdf5 \
+  --model_type=MLP \
+  --privileged_collision_observation=2 \
+  --wandb_mode=disabled
+```
+
+Example using signed distance plus nearest points:
+
+```bash
+python training/train.py --config configs/train_config.yaml \
+  --dataset_file ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_light_context_10ep_collision_augmented.hdf5 \
+  --model_type=MLP \
+  --privileged_collision_observation=3 \
+  --wandb_mode=disabled
+```
+
+Use `data/augment_collision_info.py` to create suffixed augmented files. From
+this package directory:
+
+```bash
+python data/augment_collision_info.py \
+  --dataset_file dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep.hdf5 \
+  --output_suffix _collision_augmented \
+  --pairs object_ground object_left_finger object_right_finger object_gripper \
+  --nearest_points \
+  --overwrite
+```
+
+More details are in `data/collision_info.md`.
 
 ## Evaluate
 
@@ -143,3 +277,30 @@ PYTHONPATH=scripts/world_model python -m robot_object_wm.eval.animation \
   --output ./eval_outputs/wm_dynamics_episode.mp4 \
   --pred_horizon 10
 ```
+
+Collision overlay is enabled by default for animation/evaluation video. If the
+provided dataset is not augmented, the renderer also checks the sibling
+`*_collision_augmented.hdf5` file. Disable the overlay with:
+
+```bash
+PYTHONPATH=scripts/world_model python -m robot_object_wm.eval.animation \
+  --dataset_file /path/to/dataset.hdf5 \
+  --no_collision_info
+```
+
+## Isaac Lab Visualization
+
+Render a headless Isaac Lab video with two Franka cube-lift scenes in one frame:
+ground-truth dataset replay and open-loop world-model imagination from the same
+rollout history/control sequence.
+
+```bash
+./isaaclab.sh -p scripts/world_model/robot_object_wm/eval/isaaclab_visualization.py \
+  --config scripts/world_model/robot_object_wm/configs/isaaclab_visualization.yaml
+```
+
+The YAML selects `dataset_file`, `checkpoint`, `episode_index` or
+`episode_name`, `start_t`, `output`, and `video_width`/`video_height`.
+Episode object and robot domain parameters are applied when present, including
+object mass/inertia/material, robot link masses, and joint
+friction/damping/armature/stiffness.

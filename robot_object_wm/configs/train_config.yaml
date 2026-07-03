@@ -1,21 +1,35 @@
-# Default TrainConfig for RobotDynamics + ObjDynamics = WMDynamics.
+# Default TrainConfig for robot-object world-model training.
 
 dataset_dir: ../dataset
-dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep.hdf5
+dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
 
 # split: robot DeLaN + object MLP
 # whole: one DeLaN over robot + object generalized coordinates
+# MLP: pure MLP whole-state model; delan_use_film enables FiLM on the MLP
 # rwm: RWMEnsemble whole-dynamics model configured by rwm_config.yaml
-model_type: rwm
+model_type: MLP
 rwm_config: rwm_config.yaml
 
-history_len: 32
-rollout_horizon: 8
+delan_use_history : false
+
+history_len: 8
+rollout_horizon: 5
 robot_dof: 9
 action_dim: 8
 torque_dim: 9
 action_type: torque  # policy or torque
 torque_key: applied_torque
+
+# Privileged collision observation appended to state. Current default uses
+# signed distance, giving state_dim = 31 + 4 collision pairs = 35.
+# 0: none
+# 1: collision flag
+# 2: signed distance
+# 3: signed distance + nearest points
+privileged_collision_observation: 3
+privileged_collision_group: privileged_collision
+privileged_collision_pairs: object_ground,object_left_finger,object_right_finger,object_gripper
+privileged_collision_loss_weight: 1.0
 
 hidden_dim: 256
 object_hidden_dim: 256
@@ -46,6 +60,13 @@ context_encoder_depth: 2
 delan_use_film: false
 delan_film_depth: 2
 lambda_context_kl: 1.0e-4
+
+# Optional soft InfoNCE on context z using object_context as privileged similarity.
+use_context_info_nce: false
+lambda_context_info_nce: 1.0
+context_info_nce_temperature: 0.1
+context_info_nce_similarity_sigma: 1.0
+context_info_nce_negative_weight: 1.0
 
 train_split: 0.9
 seed: 42
@@ -82,7 +103,7 @@ eval_max_episodes:
 eval_num_workers: 0
 
 eval_episode_plot: true
-eval_episode_index: 0
+eval_episode_index: 26
 eval_episode_name:
 eval_start_t: 25
 eval_rollout_steps: 25
@@ -95,3 +116,6 @@ eval_prediction_max_episodes: 10
 eval_video: true
 eval_fps: 25
 eval_max_frames: 250
+eval_collision_info: true
+eval_collision_group: privileged_collision
+eval_collision_dataset_file:

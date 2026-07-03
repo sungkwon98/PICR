@@ -168,9 +168,12 @@ class DeLaNCore(nn.Module):
         hidden_dim: int,
         eps: float = 1.0e-4,
         diag_eps: float = 1.0e-3,
+        history_len : int =1,
         latent_dim: int | None = None,
         use_film: bool = False,
         film_depth: int = 2,
+        whole_dynamics: bool=False,
+        history_state_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.robot_dof = robot_dof
@@ -179,46 +182,50 @@ class DeLaNCore(nn.Module):
         n_offdiag = robot_dof * (robot_dof - 1) // 2
         self.use_film = bool(use_film) and latent_dim is not None and latent_dim > 0
         self.latent_dim = int(latent_dim) if self.use_film else None
-
+        if history_state_dim is None:
+            history_state_dim = (2 * robot_dof + 13) if not whole_dynamics else (2 * robot_dof + 1)
+        history_dim = (history_len - 1) * int(history_state_dim)
         if self.use_film:
-            self.v_net = FiLMDerivativeMLP(robot_dof, hidden_dim, 1, depth=film_depth, latent_dim=int(latent_dim))
+            self.v_net = FiLMDerivativeMLP(robot_dof + history_dim, hidden_dim, 1, depth=film_depth, latent_dim=int(latent_dim))
             self.l_diag_net = FiLMDerivativeMLP(
-                robot_dof,
+                robot_dof + history_dim,
                 hidden_dim,
                 robot_dof,
                 depth=film_depth,
                 latent_dim=int(latent_dim),
             )
             self.l_offdiag_net = FiLMDerivativeMLP(
-                robot_dof,
+                robot_dof + history_dim,
                 hidden_dim,
                 n_offdiag,
                 depth=film_depth,
                 latent_dim=int(latent_dim),
             )
         else:
-            self.v_net = DerivativeMLP(robot_dof, hidden_dim, 1, depth=2)
-            self.l_diag_net = DerivativeMLP(robot_dof, hidden_dim, robot_dof, depth=2)
-            self.l_offdiag_net = DerivativeMLP(robot_dof, hidden_dim, n_offdiag, depth=2)
+            self.v_net = DerivativeMLP(robot_dof + history_dim, hidden_dim, 1, depth=2)
+            self.l_diag_net = DerivativeMLP(robot_dof + history_dim, hidden_dim, robot_dof, depth=2)
+            self.l_offdiag_net = DerivativeMLP(robot_dof + history_dim, hidden_dim, n_offdiag, depth=2)
 
         offdiag = torch.tril_indices(row=robot_dof, col=robot_dof, offset=-1)
         self.register_buffer("offdiag_row", offdiag[0], persistent=False)
         self.register_buffer("offdiag_col", offdiag[1], persistent=False)
         self.register_buffer("diag_idx", torch.arange(robot_dof), persistent=False)
 
-    def make_l_and_derivatives(self, q: torch.Tensor, z: torch.Tensor | None = None):
-        batch = q.shape[0]
+    def make_l_and_derivatives(self, x: torch.Tensor, z: torch.Tensor | None = None):
+        batch = x.shape[0]
         if self.use_film:
             if z is None:
                 raise ValueError("DeLaNCore.use_film=True requires latent z.")
-            l_diag_raw, dl_diag_raw_dq = self.l_diag_net.forward_with_jacobian(q, z)
-            l_offdiag, dl_offdiag_dq = self.l_offdiag_net.forward_with_jacobian(q, z)
+            l_diag_raw, dl_diag_raw_dx = self.l_diag_net.forward_with_jacobian(x, z)
+            l_offdiag, dl_offdiag_dx = self.l_offdiag_net.forward_with_jacobian(x, z)
         else:
-            l_diag_raw, dl_diag_raw_dq = self.l_diag_net.forward_with_jacobian(q)
-            l_offdiag, dl_offdiag_dq = self.l_offdiag_net.forward_with_jacobian(q)
+            l_diag_raw, dl_diag_raw_dx = self.l_diag_net.forward_with_jacobian(x)
+            l_offdiag, dl_offdiag_dx = self.l_offdiag_net.forward_with_jacobian(x)
+        dl_diag_raw_dq = dl_diag_raw_dx[..., -self.robot_dof:]
+        dl_offdiag_dq = dl_offdiag_dx[..., -self.robot_dof:]
 
-        L = q.new_zeros((batch, self.robot_dof, self.robot_dof))
-        dL_dq = q.new_zeros((batch, self.robot_dof, self.robot_dof, self.robot_dof))
+        L = x.new_zeros((batch, self.robot_dof, self.robot_dof))
+        dL_dq = x.new_zeros((batch, self.robot_dof, self.robot_dof, self.robot_dof))
         L[:, self.offdiag_row, self.offdiag_col] = l_offdiag
         dL_dq[:, self.offdiag_row, self.offdiag_col, :] = dl_offdiag_dq
 
@@ -228,9 +235,9 @@ class DeLaNCore(nn.Module):
         dL_dq[:, self.diag_idx, self.diag_idx, :] = dl_diag_dq
         return L, dL_dq, l_diag, l_offdiag
 
-    def inertia(self, q: torch.Tensor, z: torch.Tensor | None = None):
-        L, dL_dq, l_diag, l_offdiag = self.make_l_and_derivatives(q, z=z)
-        eye = torch.eye(self.robot_dof, device=q.device, dtype=q.dtype).unsqueeze(0)
+    def inertia(self, x: torch.Tensor, z: torch.Tensor | None = None):
+        L, dL_dq, l_diag, l_offdiag = self.make_l_and_derivatives(x, z=z)
+        eye = torch.eye(self.robot_dof, device=x.device, dtype=x.dtype).unsqueeze(0)
         H = L @ L.transpose(-1, -2) + self.eps * eye
         return H, L, dL_dq, l_diag, l_offdiag
 
@@ -243,14 +250,15 @@ class DeLaNCore(nn.Module):
         kinetic_grad = torch.einsum("bi,bijk,bj->bk", dq, dH_dq, dq)
         return dH_dt_dq - 0.5 * kinetic_grad
 
-    def forward(self, q: torch.Tensor, dq: torch.Tensor, z: torch.Tensor | None = None) -> DelanTerms:
-        H, L, dL_dq, l_diag, l_offdiag = self.inertia(q, z=z)
+    def forward(self, x: torch.Tensor, dq: torch.Tensor, z: torch.Tensor | None = None) -> DelanTerms:
+        H, L, dL_dq, l_diag, l_offdiag = self.inertia(x, z=z)
         if self.use_film:
             if z is None:
                 raise ValueError("DeLaNCore.use_film=True requires latent z.")
-            V, dV_dq = self.v_net.forward_with_jacobian(q, z)
+            V, dV_dx = self.v_net.forward_with_jacobian(x, z)
         else:
-            V, dV_dq = self.v_net.forward_with_jacobian(q)
+            V, dV_dx = self.v_net.forward_with_jacobian(x)
+        dV_dq = dV_dx[..., -self.robot_dof:]
         coriolis = self.coriolis_centrifugal(L, dL_dq, dq)
         g= dV_dq.squeeze(1)
         return DelanTerms(H=H, L=L, dL_dq=dL_dq, l_diag=l_diag, l_offdiag=l_offdiag, g=g, coriolis=coriolis)
@@ -265,10 +273,13 @@ class DeLaNRobotDynamics(nn.Module):
         torque_dim: int = 9,
         hidden_dim: int = 256,
         dt: float = 0.02,
+        history_len : int =1,
         latent_dim: int | None = None,
         use_film: bool = False,
         film_depth: int = 2,
         ode_solver: str = "euler",
+        use_history: bool = False,
+        history_state_dim: int | None = None,
     ) -> None:
         super().__init__()
         if torque_dim != robot_dof:
@@ -278,17 +289,20 @@ class DeLaNRobotDynamics(nn.Module):
         self.dt = dt
         self.ode_solver = validate_ode_solver(ode_solver)
         self.use_film = bool(use_film) and latent_dim is not None and latent_dim > 0
+        self.use_history = use_history
         self.core = DeLaNCore(
             robot_dof=robot_dof,
             hidden_dim=hidden_dim,
+            history_len=history_len if use_history else 1,
             latent_dim=latent_dim if self.use_film else None,
             use_film=self.use_film,
             film_depth=film_depth,
+            history_state_dim=history_state_dim,
         )
 
     def forward(
         self,
-        q: torch.Tensor,
+        x: torch.Tensor,
         dq: torch.Tensor,
         torque: torch.Tensor,
         external_torque: torch.Tensor | None = None,
@@ -296,9 +310,10 @@ class DeLaNRobotDynamics(nn.Module):
     ) -> RobotDynamicsOutput:
         external = torch.zeros_like(torque) if external_torque is None else external_torque
         effective_torque = torque + external
-        ddq, terms = self.acceleration(q, dq, effective_torque, z=z)
+        ddq, terms = self.acceleration(x, dq, effective_torque, z=z)
         inertial = (terms.H @ ddq.unsqueeze(-1)).squeeze(-1)
-        next_q, next_dq = self.integrate(q, dq, effective_torque, ddq=ddq, z=z)
+        q = x[..., -self.robot_dof:]
+        next_q, next_dq = self.integrate(x, dq, effective_torque, ddq=ddq, z=z)
 
         aux = terms.as_aux()
         aux.update(
@@ -316,13 +331,15 @@ class DeLaNRobotDynamics(nn.Module):
 
     def acceleration(
         self,
-        q: torch.Tensor,
+        x: torch.Tensor,
         dq: torch.Tensor,
         effective_torque: torch.Tensor,
         *,
         z: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, DelanTerms]:
-        terms = self.core(q, dq, z=z if self.use_film else None)
+        if not self.use_history:
+            x = x[:, -self.robot_dof:]
+        terms = self.core(x, dq, z=z if self.use_film else None)
         rhs = effective_torque - terms.g - terms.coriolis
         ddq = safe_solve(terms.H, rhs)
         ddq = torch.nan_to_num(ddq, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -331,54 +348,68 @@ class DeLaNRobotDynamics(nn.Module):
 
     def state_derivative(
         self,
-        q: torch.Tensor,
+        x: torch.Tensor,
         dq: torch.Tensor,
         effective_torque: torch.Tensor,
         *,
         z: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        ddq, _terms = self.acceleration(q, dq, effective_torque, z=z)
+        ddq, _terms = self.acceleration(x, dq, effective_torque, z=z)
         return dq, ddq
 
     def integrate(
         self,
-        q: torch.Tensor,
+        x: torch.Tensor,
         dq: torch.Tensor,
         effective_torque: torch.Tensor,
         *,
         ddq: torch.Tensor,
         z: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = x[..., -self.robot_dof:]
         if self.ode_solver == "euler":
             next_dq = dq + ddq * self.dt
             next_q = q + next_dq * self.dt
             return next_q, next_dq
-        return self._rk4_integrate(q, dq, effective_torque, z=z)
+        return self._rk4_integrate(x, dq, effective_torque, z=z)
+
+    def replace_current_q(self, x: torch.Tensor, q_new: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] == self.robot_dof:
+            return q_new
+        return torch.cat([x[..., :-self.robot_dof], q_new], dim=-1)
 
     def _rk4_integrate(
         self,
-        q: torch.Tensor,
+        x: torch.Tensor,
         dq: torch.Tensor,
         effective_torque: torch.Tensor,
         *,
         z: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dt = self.dt
-        k1_q, k1_dq = self.state_derivative(q, dq, effective_torque, z=z)
+        k1_q, k1_dq = self.state_derivative(x, dq, effective_torque, z=z)
+        q = x[...,-self.robot_dof:] 
+        new_q = q + 0.5 * dt * k1_q
+        new_x = x.clone()
+        new_x[...,-self.robot_dof:] = new_q 
         k2_q, k2_dq = self.state_derivative(
-            q + 0.5 * dt * k1_q,
+            new_x,
             dq + 0.5 * dt * k1_dq,
             effective_torque,
             z=z,
         )
+        new_q = q + 0.5 * dt * k2_q
+        new_x[...,-self.robot_dof:] = new_q 
         k3_q, k3_dq = self.state_derivative(
-            q + 0.5 * dt * k2_q,
+            new_x,
             dq + 0.5 * dt * k2_dq,
             effective_torque,
             z=z,
         )
+        new_q = q + dt * k3_q
+        new_x[...,-self.robot_dof:] = new_q 
         k4_q, k4_dq = self.state_derivative(
-            q + dt * k3_q,
+            new_x,
             dq + dt * k3_dq,
             effective_torque,
             z=z,

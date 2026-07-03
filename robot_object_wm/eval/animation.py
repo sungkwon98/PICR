@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import os
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter  # no
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
+from robot_object_wm.data.dataset import h5_open
 from robot_object_wm.eval.episode import (
     EpisodeData,
     compute_joint_positions,
@@ -57,6 +59,16 @@ _CUBE_CORNERS_LOCAL = np.asarray(
 )
 
 
+@dataclass
+class CollisionOverlay:
+    pair_names: list[str]
+    collision: np.ndarray
+    distance: np.ndarray | None = None
+    signed_distance: np.ndarray | None = None
+    nearest_points: np.ndarray | None = None
+    source_file: str = ""
+
+
 def render_checkpoint_animation(
     *,
     model: torch.nn.Module,
@@ -73,6 +85,9 @@ def render_checkpoint_animation(
     cube_size: float = 0.04,
     show_trails: bool = True,
     show_gt_future: bool = True,
+    show_collision_info: bool = True,
+    collision_group: str = "privileged_collision",
+    collision_dataset_file: str | None = None,
 ) -> str:
     torch_device = torch.device(device or next(model.parameters()).device)
     episode = load_episode_data(
@@ -86,9 +101,23 @@ def render_checkpoint_animation(
         subtract_env_origin=cfg.subtract_env_origin,
         max_frames=max_frames,
         dt=cfg.dt,
+        privileged_collision_observation=cfg.privileged_collision_observation,
+        privileged_collision_group=cfg.privileged_collision_group,
+        privileged_collision_pairs=cfg.privileged_collision_pairs,
     )
     fk = FrankaForwardKinematics(robot_dof=cfg.robot_dof, tool_z_offset=cfg.tool_z_offset).to(torch_device)
     fk.eval()
+    collision_overlay = (
+        load_collision_overlay(
+            collision_dataset_file or dataset_file,
+            episode.name,
+            max_frames=episode.T,
+            group_name=collision_group,
+            fallback_dataset_file=dataset_file,
+        )
+        if show_collision_info
+        else None
+    )
     pred_target_per_t, pred_object_per_t = precompute_prediction_trajectories(
         model,
         episode,
@@ -112,6 +141,7 @@ def render_checkpoint_animation(
         pred_horizon=pred_horizon,
         target=target,
         show_gt_future=show_gt_future,
+        collision_overlay=collision_overlay,
     )
 
 
@@ -133,6 +163,9 @@ def render_dataset_animation(
     cube_size: float = 0.04,
     show_trails: bool = True,
     show_gt_future: bool = True,
+    show_collision_info: bool = True,
+    collision_group: str = "privileged_collision",
+    collision_dataset_file: str | None = None,
     device: torch.device | str = "cpu",
 ) -> str:
     torch_device = torch.device(device)
@@ -150,6 +183,17 @@ def render_dataset_animation(
     )
     fk = FrankaForwardKinematics(robot_dof=robot_dof, tool_z_offset=tool_z_offset).to(torch_device)
     fk.eval()
+    collision_overlay = (
+        load_collision_overlay(
+            collision_dataset_file or dataset_file,
+            episode.name,
+            max_frames=episode.T,
+            group_name=collision_group,
+            fallback_dataset_file=dataset_file,
+        )
+        if show_collision_info
+        else None
+    )
     return render_animation(
         episode=episode,
         fk=fk,
@@ -159,6 +203,7 @@ def render_dataset_animation(
         cube_size=cube_size,
         show_trails=show_trails,
         show_gt_future=show_gt_future,
+        collision_overlay=collision_overlay,
     )
 
 
@@ -210,6 +255,7 @@ def render_animation(
     pred_horizon: int = 10,
     target: str = "gripper",
     show_gt_future: bool = True,
+    collision_overlay: CollisionOverlay | None = None,
 ) -> str:
     joints_3d = compute_joint_positions(episode.joint_pos_abs, fk, device)
     object_pos = episode.object_pos
@@ -282,6 +328,46 @@ def render_animation(
             )[0]
         )
 
+    contact_marker = ax.scatter(
+        [np.nan],
+        [np.nan],
+        [np.nan],
+        s=260,
+        marker="*",
+        c="tab:orange",
+        edgecolors="black",
+        linewidths=0.8,
+        depthshade=False,
+        label="Active collision",
+        zorder=7,
+    )
+    collision_points_a = ax.scatter(
+        [np.nan],
+        [np.nan],
+        [np.nan],
+        s=80,
+        marker="o",
+        c="tab:cyan",
+        edgecolors="black",
+        linewidths=0.6,
+        depthshade=False,
+        label="Collision point A",
+        zorder=8,
+    )
+    collision_points_b = ax.scatter(
+        [np.nan],
+        [np.nan],
+        [np.nan],
+        s=80,
+        marker="X",
+        c="tab:purple",
+        edgecolors="black",
+        linewidths=0.6,
+        depthshade=False,
+        label="Collision point B",
+        zorder=8,
+    )
+
     gripper_trail = cube_trail = None
     if show_trails:
         gripper_trail = ax.plot([], [], [], color="tab:blue", linewidth=1.0, alpha=0.55, zorder=2)[0]
@@ -346,15 +432,28 @@ def render_animation(
     ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
 
     time_text = ax.text2D(0.02, 0.96, "", transform=ax.transAxes, fontsize=12)
+    collision_text = ax.text2D(
+        0.02,
+        0.90,
+        "",
+        transform=ax.transAxes,
+        fontsize=10,
+        color="black",
+        bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "0.75", "boxstyle": "round,pad=0.35"},
+    )
     ax.set_title(f"Episode '{episode.name}'")
 
     def update(frame: int):
+        contact_summary = _collision_summary(collision_overlay, frame)
+        cube_color = _cube_collision_color(contact_summary)
+        cube_width = 3.2 if contact_summary["active"] else 2.0
         joint_scatter._offsets3d = (
             joints_3d[frame, :, 0],
             joints_3d[frame, :, 1],
             joints_3d[frame, :, 2],
         )
         for idx, line in enumerate(link_lines):
+            line.set_color("tab:orange" if contact_summary["gripper_active"] and idx >= len(link_lines) - 2 else "black")
             line.set_data_3d(
                 [joints_3d[frame, idx, 0], joints_3d[frame, idx + 1, 0]],
                 [joints_3d[frame, idx, 1], joints_3d[frame, idx + 1, 1]],
@@ -363,11 +462,30 @@ def render_animation(
         corners = cube_corners(object_pos[frame], object_quat[frame], cube_size)
         for line, edge in zip(cube_lines, _CUBE_EDGES):
             i, j = int(edge[0]), int(edge[1])
+            line.set_color(cube_color)
+            line.set_linewidth(cube_width)
             line.set_data_3d(
                 [corners[i, 0], corners[j, 0]],
                 [corners[i, 1], corners[j, 1]],
                 [corners[i, 2], corners[j, 2]],
             )
+        if contact_summary["active"]:
+            contact_marker._offsets3d = (
+                object_pos[frame : frame + 1, 0],
+                object_pos[frame : frame + 1, 1],
+                object_pos[frame : frame + 1, 2],
+            )
+        else:
+            contact_marker._offsets3d = nan_xyz
+        points_a, points_b = _collision_points_for_frame(collision_overlay, frame)
+        if points_a.size > 0:
+            collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2])
+        else:
+            collision_points_a._offsets3d = nan_xyz
+        if points_b.size > 0:
+            collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2])
+        else:
+            collision_points_b._offsets3d = nan_xyz
         if gripper_trail is not None and cube_trail is not None:
             gripper_trail.set_data_3d(joints_3d[: frame + 1, -1, 0], joints_3d[: frame + 1, -1, 1], joints_3d[: frame + 1, -1, 2])
             cube_trail.set_data_3d(object_pos[: frame + 1, 0], object_pos[: frame + 1, 1], object_pos[: frame + 1, 2])
@@ -390,6 +508,7 @@ def render_animation(
                 gt_target_line.set_data_3d(*nan_xyz)
                 gt_object_line.set_data_3d(*nan_xyz)
         time_text.set_text(f"t = {frame * episode.dt:.2f} s   step {frame + 1}/{T}")
+        collision_text.set_text(contact_summary["text"])
         return ()
 
     anim = FuncAnimation(fig, update, frames=T, interval=1000.0 / max(1, fps), blit=False)
@@ -439,12 +558,166 @@ def cube_corners(center: np.ndarray, quat: np.ndarray, size: float) -> np.ndarra
     return (_CUBE_CORNERS_LOCAL * half) @ _quat_to_rotation_matrix_np(quat).T + center[None, :]
 
 
+def collision_augmented_path(dataset_file: str) -> str:
+    path = Path(dataset_file)
+    if path.stem.endswith("_collision_augmented"):
+        return str(path)
+    return str(path.with_name(f"{path.stem}_collision_augmented{path.suffix}"))
+
+
+def _decode_hdf5_strings(values: np.ndarray) -> list[str]:
+    names: list[str] = []
+    for value in values:
+        if isinstance(value, bytes):
+            names.append(value.decode("utf-8"))
+        else:
+            names.append(str(value))
+    return names
+
+
+def _candidate_collision_files(dataset_file: str, fallback_dataset_file: str | None = None) -> list[str]:
+    candidates: list[str] = []
+    for path in (dataset_file, fallback_dataset_file):
+        if not path:
+            continue
+        for candidate in (path, collision_augmented_path(path)):
+            candidate = os.path.abspath(candidate)
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def load_collision_overlay(
+    dataset_file: str,
+    episode_name: str,
+    *,
+    max_frames: int = 0,
+    group_name: str = "privileged_collision",
+    fallback_dataset_file: str | None = None,
+) -> CollisionOverlay | None:
+    for path in _candidate_collision_files(dataset_file, fallback_dataset_file):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with h5_open(path) as file:
+                group_path = f"data/{episode_name}/{group_name}"
+                if group_path not in file:
+                    continue
+                group = file[group_path]
+                pair_names = _decode_hdf5_strings(np.asarray(group["pair_names"]))
+                collision = np.asarray(group["collision"], dtype=bool)
+                distance = np.asarray(group["distance"], dtype=np.float32) if "distance" in group else None
+                signed_distance = (
+                    np.asarray(group["signed_distance"], dtype=np.float32) if "signed_distance" in group else None
+                )
+                nearest_points = (
+                    np.asarray(group["nearest_points"], dtype=np.float32) if "nearest_points" in group else None
+                )
+        except Exception as exc:
+            print(f"[WARN] Could not read collision info from {path}: {exc}")
+            continue
+
+        if max_frames > 0:
+            collision = collision[:max_frames]
+            if distance is not None:
+                distance = distance[:max_frames]
+            if signed_distance is not None:
+                signed_distance = signed_distance[:max_frames]
+            if nearest_points is not None:
+                nearest_points = nearest_points[:max_frames]
+        print(f"Loaded collision overlay: {path}::{group_path}")
+        return CollisionOverlay(
+            pair_names=pair_names,
+            collision=collision,
+            distance=distance,
+            signed_distance=signed_distance,
+            nearest_points=nearest_points,
+            source_file=path,
+        )
+    return None
+
+
+def _collision_summary(overlay: CollisionOverlay | None, frame: int) -> dict[str, object]:
+    if overlay is None:
+        return {
+            "active": False,
+            "gripper_active": False,
+            "ground_active": False,
+            "text": "collision: unavailable",
+        }
+    if frame >= overlay.collision.shape[0]:
+        return {
+            "active": False,
+            "gripper_active": False,
+            "ground_active": False,
+            "text": "collision: out of range",
+        }
+
+    active_indices = np.flatnonzero(overlay.collision[frame])
+    active_names = [overlay.pair_names[int(idx)] for idx in active_indices]
+    gripper_active = any(name in {"object_left_finger", "object_right_finger", "object_gripper"} for name in active_names)
+    ground_active = any(name in {"object_ground", "left_finger_ground", "right_finger_ground", "gripper_ground"} for name in active_names)
+
+    if active_names:
+        parts = []
+        for idx, name in zip(active_indices[:4], active_names[:4]):
+            if overlay.distance is not None and frame < overlay.distance.shape[0]:
+                parts.append(f"{name}:{overlay.distance[frame, int(idx)]:.3f}m")
+            else:
+                parts.append(name)
+        if len(active_names) > 4:
+            parts.append(f"+{len(active_names) - 4} more")
+        text = "collision: " + ", ".join(parts)
+    else:
+        if overlay.distance is not None and overlay.distance.shape[1] > 0:
+            finite = overlay.distance[frame][np.isfinite(overlay.distance[frame])]
+            text = f"collision: none  nearest={float(np.min(finite)):.3f}m" if finite.size else "collision: none"
+        else:
+            text = "collision: none"
+
+    return {
+        "active": bool(active_names),
+        "gripper_active": gripper_active,
+        "ground_active": ground_active,
+        "text": text,
+    }
+
+
+def _collision_points_for_frame(overlay: CollisionOverlay | None, frame: int) -> tuple[np.ndarray, np.ndarray]:
+    empty = np.zeros((0, 3), dtype=np.float32)
+    if overlay is None or overlay.nearest_points is None:
+        return empty, empty
+    if frame >= overlay.collision.shape[0] or frame >= overlay.nearest_points.shape[0]:
+        return empty, empty
+
+    active_indices = np.flatnonzero(overlay.collision[frame])
+    if active_indices.size == 0:
+        return empty, empty
+
+    points = overlay.nearest_points[frame, active_indices]
+    if points.ndim != 3 or points.shape[-2:] != (2, 3):
+        return empty, empty
+
+    finite = np.isfinite(points).all(axis=-1)
+    points_a = points[:, 0, :][finite[:, 0]]
+    points_b = points[:, 1, :][finite[:, 1]]
+    return points_a.astype(np.float32, copy=False), points_b.astype(np.float32, copy=False)
+
+
+def _cube_collision_color(summary: dict[str, object]) -> str:
+    if bool(summary["gripper_active"]):
+        return "tab:orange"
+    if bool(summary["ground_active"]):
+        return "tab:red"
+    return "tab:red"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render WMDynamics dataset/prediction animation.")
-    parser.add_argument("--dataset_file", type=str, default="./dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep.hdf5")
-    parser.add_argument("--checkpoint", type=str, default="./outputs_wm_dynamics/run_20260616_000244/best.pt")
+    parser.add_argument("--dataset_file", type=str, default="./dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5")
+    parser.add_argument("--checkpoint", type=str, default="./outputs_wm_dynamics/run_20260622_100149/best.pt")
     parser.add_argument("--output", type=str, default="./eval_outputs/wm_dynamics_episode.mp4")
-    parser.add_argument("--episode_index", type=int, default=0)
+    parser.add_argument("--episode_index", type=int, default=3)
     parser.add_argument("--episode_name", type=str, default=None)
     parser.add_argument("--robot_dof", type=int, default=9)
     parser.add_argument("--action_dim", type=int, default=8)
@@ -458,8 +731,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=25)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--cube_size", type=float, default=0.04)
-    parser.add_argument("--no_trails", dest="show_trails", action="store_false", default=True)
-    parser.add_argument("--no_gt_future", dest="show_gt_future", action="store_false", default=True)
+    parser.add_argument("--no_trails", dest="show_trails", action="store_false", default=False)
+    parser.add_argument("--no_gt_future", dest="show_gt_future", action="store_false", default=False)
+    collision = parser.add_argument_group("collision overlay")
+    collision.add_argument("--collision_info", dest="show_collision_info", action="store_true", default=True)
+    collision.add_argument("--no_collision_info", dest="show_collision_info", action="store_false")
+    collision.add_argument("--collision_group", type=str, default="privileged_collision")
+    collision.add_argument("--collision_dataset_file", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args(argv)
 
@@ -472,7 +750,7 @@ def main(argv: list[str] | None = None) -> None:
             model=loaded.model,
             cfg=loaded.config,
             dataset_file=args.dataset_file,
-            output_path=args.output,
+            output_path= f"./eval_outputs/rwm_{args.episode_index}.mp4",
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             pred_horizon=args.pred_horizon,
@@ -483,6 +761,9 @@ def main(argv: list[str] | None = None) -> None:
             cube_size=args.cube_size,
             show_trails=args.show_trails,
             show_gt_future=args.show_gt_future,
+            show_collision_info=args.show_collision_info,
+            collision_group=args.collision_group,
+            collision_dataset_file=args.collision_dataset_file,
         )
     else:
         written = render_dataset_animation(
@@ -502,6 +783,9 @@ def main(argv: list[str] | None = None) -> None:
             cube_size=args.cube_size,
             show_trails=args.show_trails,
             show_gt_future=args.show_gt_future,
+            show_collision_info=args.show_collision_info,
+            collision_group=args.collision_group,
+            collision_dataset_file=args.collision_dataset_file,
             device=args.device,
         )
     print(f"Saved: {written}")

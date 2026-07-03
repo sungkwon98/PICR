@@ -43,6 +43,7 @@ class ObjectStepInput:
 @dataclass
 class ObjectStepOutput:
     state: ObjectState
+    privileged_collision: torch.Tensor | None = None
     aux: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
@@ -62,7 +63,7 @@ class ObjectStateMLPDynamics(nn.Module):
         dt: float = 0.02,
     ) -> None:
         super().__init__()
-        del robot_dof
+        self.robot_dof = int(robot_dof)
         if history_len < 1:
             raise ValueError("history_len must be >= 1.")
         self.state_dim = int(state_dim)
@@ -70,8 +71,12 @@ class ObjectStateMLPDynamics(nn.Module):
         self.history_len = int(history_len)
         self.latent_dim = int(latent_dim)
         self.dt = float(dt)
+        self.output_dim = self.state_dim - 2 * self.robot_dof
+        if self.output_dim < 13:
+            raise ValueError(f"state_dim={self.state_dim} is too small for robot_dof={self.robot_dof}.")
+        self.privileged_collision_obs_dim = self.output_dim - 13
         input_dim = self.history_len * (self.state_dim + self.torque_dim) + self.torque_dim + self.latent_dim
-        self.net = build_mlp(input_dim, hidden_dim, 13, depth=depth)
+        self.net = build_mlp(input_dim, hidden_dim, self.output_dim, depth=depth)
 
     def step(self, values: ObjectStepInput) -> ObjectStepOutput:
         self._validate_inputs(values)
@@ -88,17 +93,19 @@ class ObjectStateMLPDynamics(nn.Module):
             parts.append(values.z)
 
         pred = self.net(torch.cat(parts, dim=-1))
+        base_pred = pred[:, :13]
         next_state = ObjectState(
-            pos=pred[:, :3],
-            quat=normalize_quat(pred[:, 3:7]),
-            lin_vel=pred[:, 7:10],
-            ang_vel=pred[:, 10:13],
+            pos=base_pred[:, :3],
+            quat=normalize_quat(base_pred[:, 3:7]),
+            lin_vel=base_pred[:, 7:10],
+            ang_vel=base_pred[:, 10:13],
         )
+        privileged_collision = pred[:, 13:] if self.privileged_collision_obs_dim > 0 else None
         aux = {
             "object_lin_acc": (next_state.lin_vel - values.object_state.lin_vel) / self.dt,
             "object_ang_acc": (next_state.ang_vel - values.object_state.ang_vel) / self.dt,
         }
-        return ObjectStepOutput(state=next_state, aux=aux)
+        return ObjectStepOutput(state=next_state, privileged_collision=privileged_collision, aux=aux)
 
     def _validate_inputs(self, values: ObjectStepInput) -> None:
         if values.full_state.shape[-1] != self.state_dim:
