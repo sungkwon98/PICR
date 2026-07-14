@@ -121,6 +121,8 @@ def load_checkpoint_model(
 
 def config_from_checkpoint(checkpoint: dict[str, Any]) -> TrainConfig:
     saved = dict(checkpoint.get("config", {}))
+    if "state_prediction_mode" not in saved:
+        saved["state_prediction_mode"] = "full"
     defaults = asdict(parse_args([]))
     legacy_aliases = {
         "object_mlp_hidden_dim": "object_hidden_dim",
@@ -233,6 +235,16 @@ def evaluate_loader(
     max_batches: int | None = None,
 ) -> EvaluationSummary:
     torch_device = torch.device(device or next(model.parameters()).device)
+    layout = rollout_dataset.make_robot_object_state_layout(
+        robot_dof=cfg.robot_dof,
+        action_dim=cfg.action_dim,
+        torque_dim=cfg.torque_dim,
+        state_prediction_mode=cfg.state_prediction_mode,
+        privileged_collision_obs_dim=rollout_dataset.privileged_collision_observation_dim(
+            int(cfg.privileged_collision_observation),
+            len(rollout_dataset.parse_privileged_collision_pairs(cfg.privileged_collision_pairs)),
+        ),
+    )
     model.eval()
     totals: dict[str, float] = {}
     horizon_totals: dict[str, np.ndarray] = {}
@@ -254,8 +266,8 @@ def evaluate_loader(
             pred = pred[finite_mask]
             target = target[finite_mask]
             batch_samples = int(pred.shape[0])
-            _add_weighted(totals, _batch_metrics(pred, target, cfg.robot_dof), batch_samples)
-            _add_horizon(horizon_totals, _horizon_metrics(pred, target, cfg.robot_dof), batch_samples)
+            _add_weighted(totals, _batch_metrics(pred, target, layout), batch_samples)
+            _add_horizon(horizon_totals, _horizon_metrics(pred, target, layout), batch_samples)
             n_samples += batch_samples
             n_batches += 1
 
@@ -349,10 +361,11 @@ def _resolve_hdf5_paths(*, dataset_file: str | None, dataset_dir: str) -> list[s
 
 
 def _build_eval_dataset(cfg: TrainConfig, refs: list[Any]):
-    layout = rollout_dataset.RobotObjectWMStateLayout(
+    layout = rollout_dataset.make_robot_object_state_layout(
         robot_dof=cfg.robot_dof,
         action_dim=cfg.action_dim,
         torque_dim=cfg.torque_dim,
+        state_prediction_mode=cfg.state_prediction_mode,
         privileged_collision_obs_dim=rollout_dataset.privileged_collision_observation_dim(
             int(cfg.privileged_collision_observation),
             len(rollout_dataset.parse_privileged_collision_pairs(cfg.privileged_collision_pairs)),
@@ -378,55 +391,105 @@ def _build_eval_dataset(cfg: TrainConfig, refs: list[Any]):
     return layout, dataset
 
 
-def _batch_metrics(pred: torch.Tensor, target: torch.Tensor, robot_dof: int) -> dict[str, float]:
-    offset = 2 * robot_dof
-    object_pos_error = torch.linalg.norm(pred[..., offset : offset + 3] - target[..., offset : offset + 3], dim=-1)
+def _batch_metrics(pred: torch.Tensor, target: torch.Tensor, layout) -> dict[str, float]:
+    object_pos_error = torch.linalg.norm(
+        pred[..., layout.object_pos_slice] - target[..., layout.object_pos_slice],
+        dim=-1,
+    )
     final_object_pos_error = object_pos_error[:, -1]
-    return {
+    metrics = {
         "rollout_mse": float(torch.mean((pred - target).square()).item()),
-        "q_mse": float(torch.mean((pred[..., :robot_dof] - target[..., :robot_dof]).square()).item()),
-        "dq_mse": float(torch.mean((pred[..., robot_dof:offset] - target[..., robot_dof:offset]).square()).item()),
-        "object_pos_mse": float(torch.mean((pred[..., offset : offset + 3] - target[..., offset : offset + 3]).square()).item()),
-        "object_quat_mse": float(torch.mean((pred[..., offset + 3 : offset + 7] - target[..., offset + 3 : offset + 7]).square()).item()),
-        "object_lin_vel_mse": float(torch.mean((pred[..., offset + 7 : offset + 10] - target[..., offset + 7 : offset + 10]).square()).item()),
-        "object_ang_vel_mse": float(torch.mean((pred[..., offset + 10 : offset + 13] - target[..., offset + 10 : offset + 13]).square()).item()),
+        "q_mse": float(torch.mean((pred[..., layout.robot_q_slice] - target[..., layout.robot_q_slice]).square()).item()),
+        "object_pos_mse": float(
+            torch.mean((pred[..., layout.object_pos_slice] - target[..., layout.object_pos_slice]).square()).item()
+        ),
+        "object_quat_mse": float(
+            torch.mean((pred[..., layout.object_quat_slice] - target[..., layout.object_quat_slice]).square()).item()
+        ),
         "object_pos_error_mean": float(object_pos_error.mean().item()),
         "object_pos_error_final": float(final_object_pos_error.mean().item()),
     }
+    if layout.has_joint_vel:
+        metrics["dq_mse"] = float(
+            torch.mean((pred[..., layout.robot_dq_slice] - target[..., layout.robot_dq_slice]).square()).item()
+        )
+    if layout.has_object_lin_vel:
+        metrics["object_lin_vel_mse"] = float(
+            torch.mean(
+                (pred[..., layout.object_lin_vel_slice] - target[..., layout.object_lin_vel_slice]).square()
+            ).item()
+        )
+    if layout.has_object_ang_vel:
+        metrics["object_ang_vel_mse"] = float(
+            torch.mean(
+                (pred[..., layout.object_ang_vel_slice] - target[..., layout.object_ang_vel_slice]).square()
+            ).item()
+        )
+    return metrics
 
 
-def _horizon_metrics(pred: torch.Tensor, target: torch.Tensor, robot_dof: int) -> dict[str, np.ndarray]:
-    offset = 2 * robot_dof
-    object_pos_error = torch.linalg.norm(pred[..., offset : offset + 3] - target[..., offset : offset + 3], dim=-1)
+def _horizon_metrics(pred: torch.Tensor, target: torch.Tensor, layout) -> dict[str, np.ndarray]:
+    object_pos_error = torch.linalg.norm(
+        pred[..., layout.object_pos_slice] - target[..., layout.object_pos_slice],
+        dim=-1,
+    )
     batch = pred.shape[0]
-    return {
+    metrics = {
         "object_pos_error": object_pos_error.sum(dim=0).detach().cpu().numpy(),
         "rollout_mse": torch.mean((pred - target).square(), dim=(0, 2)).detach().cpu().numpy() * batch,
-        "q_mse": torch.mean((pred[..., :robot_dof] - target[..., :robot_dof]).square(), dim=(0, 2)).detach().cpu().numpy()
-        * batch,
-        "dq_mse": torch.mean((pred[..., robot_dof:offset] - target[..., robot_dof:offset]).square(), dim=(0, 2)).detach().cpu().numpy()
-        * batch,
-        "object_pos_mse": torch.mean((pred[..., offset : offset + 3] - target[..., offset : offset + 3]).square(), dim=(0, 2))
+        "q_mse": torch.mean((pred[..., layout.robot_q_slice] - target[..., layout.robot_q_slice]).square(), dim=(0, 2))
         .detach()
         .cpu()
         .numpy()
         * batch,
-        "object_quat_mse": torch.mean((pred[..., offset + 3 : offset + 7] - target[..., offset + 3 : offset + 7]).square(), dim=(0, 2))
+        "object_pos_mse": torch.mean(
+            (pred[..., layout.object_pos_slice] - target[..., layout.object_pos_slice]).square(),
+            dim=(0, 2),
+        )
         .detach()
         .cpu()
         .numpy()
         * batch,
-        "object_lin_vel_mse": torch.mean((pred[..., offset + 7 : offset + 10] - target[..., offset + 7 : offset + 10]).square(), dim=(0, 2))
-        .detach()
-        .cpu()
-        .numpy()
-        * batch,
-        "object_ang_vel_mse": torch.mean((pred[..., offset + 10 : offset + 13] - target[..., offset + 10 : offset + 13]).square(), dim=(0, 2))
+        "object_quat_mse": torch.mean(
+            (pred[..., layout.object_quat_slice] - target[..., layout.object_quat_slice]).square(),
+            dim=(0, 2),
+        )
         .detach()
         .cpu()
         .numpy()
         * batch,
     }
+    if layout.has_joint_vel:
+        metrics["dq_mse"] = (
+            torch.mean((pred[..., layout.robot_dq_slice] - target[..., layout.robot_dq_slice]).square(), dim=(0, 2))
+            .detach()
+            .cpu()
+            .numpy()
+            * batch
+        )
+    if layout.has_object_lin_vel:
+        metrics["object_lin_vel_mse"] = (
+            torch.mean(
+                (pred[..., layout.object_lin_vel_slice] - target[..., layout.object_lin_vel_slice]).square(),
+                dim=(0, 2),
+            )
+            .detach()
+            .cpu()
+            .numpy()
+            * batch
+        )
+    if layout.has_object_ang_vel:
+        metrics["object_ang_vel_mse"] = (
+            torch.mean(
+                (pred[..., layout.object_ang_vel_slice] - target[..., layout.object_ang_vel_slice]).square(),
+                dim=(0, 2),
+            )
+            .detach()
+            .cpu()
+            .numpy()
+            * batch
+        )
+    return metrics
 
 
 def _add_weighted(totals: dict[str, float], metrics: dict[str, float], weight: int) -> None:
@@ -562,6 +625,7 @@ def _write_episode_plot(args, loaded: LoadedWorldModel, dataset_file: str) -> di
         subtract_env_origin=cfg.subtract_env_origin,
         max_frames=args.max_frames,
         dt=cfg.dt,
+        state_prediction_mode=cfg.state_prediction_mode,
         privileged_collision_observation=cfg.privileged_collision_observation,
         privileged_collision_group=cfg.privileged_collision_group,
         privileged_collision_pairs=cfg.privileged_collision_pairs,
@@ -641,6 +705,7 @@ def _write_prediction_metrics(args, loaded: LoadedWorldModel, dataset_file: str)
         torque_key=cfg.torque_key,
         subtract_env_origin=cfg.subtract_env_origin,
         dt=cfg.dt,
+        state_prediction_mode=cfg.state_prediction_mode,
         privileged_collision_observation=cfg.privileged_collision_observation,
         privileged_collision_group=cfg.privileged_collision_group,
         privileged_collision_pairs=cfg.privileged_collision_pairs,

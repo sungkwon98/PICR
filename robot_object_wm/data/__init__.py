@@ -2,7 +2,12 @@
 
 from .contact_labels import estimate_object_velocity, first_object_motion_timestep
 from .dataset import discover_hdf5_files, load_all_episode_refs, load_episode_names, split_episode_refs
-from .hdf5_schema import EpisodeRef, RobotObjectStateLayout
+from .hdf5_schema import (
+    EpisodeRef,
+    RobotObjectStateLayout,
+    make_robot_object_state_layout,
+    normalize_state_prediction_mode,
+)
 from .rollout_dataset import RobotObjectWMRolloutDataset, RobotObjectWMStateLayout
 
 __all__ = [
@@ -15,5 +20,7 @@ __all__ = [
     "first_object_motion_timestep",
     "load_all_episode_refs",
     "load_episode_names",
+    "make_robot_object_state_layout",
+    "normalize_state_prediction_mode",
     "split_episode_refs",
 ]

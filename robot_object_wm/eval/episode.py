@@ -9,6 +9,7 @@ import torch
 
 from robot_object_wm.data import rollout_dataset
 from robot_object_wm.data.dataset import h5_open
+from robot_object_wm.data.hdf5_schema import RobotObjectStateLayout
 from robot_object_wm.models.rwm import RWMEnsemble
 from robot_object_wm.models.utils import FrankaForwardKinematics
 
@@ -24,6 +25,7 @@ class EpisodeData:
     joint_pos_source: str
     object_pos: np.ndarray
     object_quat: np.ndarray
+    state_layout: RobotObjectStateLayout
     dt: float
 
     @property
@@ -76,6 +78,8 @@ def load_episode_data(
     subtract_env_origin: bool = True,
     max_frames: int = 0,
     dt: float = 0.02,
+    state_prediction_mode: str = "full",
+    state_layout: RobotObjectStateLayout | None = None,
     privileged_collision_observation: int = 0,
     privileged_collision_group: str = "privileged_collision",
     privileged_collision_pairs: str | None = None,
@@ -83,6 +87,18 @@ def load_episode_data(
     if not os.path.isfile(dataset_file):
         raise FileNotFoundError(f"Dataset file not found: {dataset_file}")
     resolved_name = resolve_episode_name(dataset_file, episode_index, episode_name)
+    if state_layout is None:
+        collision_dim = rollout_dataset.privileged_collision_observation_dim(
+            int(privileged_collision_observation),
+            len(rollout_dataset.parse_privileged_collision_pairs(privileged_collision_pairs)),
+        )
+        state_layout = rollout_dataset.make_robot_object_state_layout(
+            robot_dof=robot_dof,
+            action_dim=action_dim,
+            torque_dim=torque_dim,
+            state_prediction_mode=state_prediction_mode,
+            privileged_collision_obs_dim=collision_dim,
+        )
 
     with h5_open(dataset_file) as file:
         episode = file["data"][resolved_name]
@@ -90,16 +106,16 @@ def load_episode_data(
         object_state_group = episode["states"]["rigid_object"]["object"]
         object_dyn_group = episode["object_dynamics"]
 
-        joint_pos_rel = np.asarray(obs["joint_pos"], dtype=np.float32)[:, :robot_dof]
-        joint_vel = np.asarray(obs["joint_vel"], dtype=np.float32)[:, :robot_dof]
-        actions = np.asarray(episode["actions"], dtype=np.float32)[:, :action_dim]
-        torques = np.asarray(episode["robot_torques"][torque_key], dtype=np.float32)[:, :torque_dim]
+        joint_pos_rel = np.asarray(obs["joint_pos"], dtype=np.float32)[:, : state_layout.robot_dof]
+        joint_vel = np.asarray(obs["joint_vel"], dtype=np.float32)[:, : int(state_layout.joint_vel_dim or 0)]
+        actions = np.asarray(episode["actions"], dtype=np.float32)[:, : state_layout.action_dim]
+        torques = np.asarray(episode["robot_torques"][torque_key], dtype=np.float32)[:, : state_layout.torque_dim]
 
         try:
             joint_pos_abs = np.asarray(
                 episode["states"]["articulation"]["robot"]["joint_position"],
                 dtype=np.float32,
-            )[:, :robot_dof]
+            )[:, : state_layout.robot_dof]
             joint_pos_source = "states/articulation/robot/joint_position"
         except KeyError:
             joint_pos_abs = joint_pos_rel
@@ -107,10 +123,16 @@ def load_episode_data(
 
         root_pose = np.asarray(object_state_group["root_pose"], dtype=np.float32)
         root_velocity = np.asarray(object_state_group["root_velocity"], dtype=np.float32)
-        object_pos_w = root_pose[:, :3]
-        object_quat = root_pose[:, 3:7]
-        object_lin_vel = root_velocity[:, :3]
-        object_ang_vel = root_velocity[:, 3:6]
+        object_pos_w = root_pose[:, : state_layout.object_pos_dim]
+        object_quat = root_pose[
+            :,
+            state_layout.object_pos_dim : state_layout.object_pos_dim + state_layout.object_quat_dim,
+        ]
+        object_lin_vel = root_velocity[:, : state_layout.object_lin_vel_dim]
+        object_ang_vel = root_velocity[
+            :,
+            state_layout.object_lin_vel_dim : state_layout.object_lin_vel_dim + state_layout.object_ang_vel_dim,
+        ]
 
         if subtract_env_origin:
             try:
@@ -177,6 +199,7 @@ def load_episode_data(
         joint_pos_source=joint_pos_source,
         object_pos=object_pos[:T].astype(np.float32),
         object_quat=object_quat[:T].astype(np.float32),
+        state_layout=state_layout,
         dt=dt,
     )
 
@@ -385,15 +408,16 @@ def rollout_cartesian(
         }
 
     start_t = rollout.start_t
-    offset = episode.joint_pos_abs[start_t] - episode.state[start_t, :robot_dof]
-    pred_q_abs = rollout.pred_states[:, :robot_dof] + offset[None, :]
+    layout = episode.state_layout
+    offset = episode.joint_pos_abs[start_t] - episode.state[start_t, layout.robot_q_slice]
+    pred_q_abs = rollout.pred_states[:, layout.robot_q_slice] + offset[None, :]
     gt_q_abs = episode.joint_pos_abs[start_t + 1 : start_t + 1 + rollout.steps]
-    obj_start = 2 * robot_dof
+    del robot_dof
     return {
         "pred_target": compute_target_points(pred_q_abs, target, fk, device),
         "gt_target": compute_target_points(gt_q_abs, target, fk, device),
-        "pred_object": rollout.pred_states[:, obj_start : obj_start + 3],
-        "gt_object": rollout.gt_states[:, obj_start : obj_start + 3],
+        "pred_object": rollout.pred_states[:, layout.object_pos_slice],
+        "gt_object": rollout.gt_states[:, layout.object_pos_slice],
         "real_episode_target": compute_target_points(episode.joint_pos_abs, target, fk, device),
         "real_episode_object": episode.object_pos,
     }
@@ -419,16 +443,15 @@ def rollout_metrics(
     if rollout.steps == 0:
         return {"evaluated_rollout_steps": 0}, cart
 
-    obj_start = 2 * robot_dof
+    layout = episode.state_layout
     pred = rollout.pred_states
     gt = rollout.gt_states
     target_error = np.linalg.norm(cart["pred_target"] - cart["gt_target"], axis=-1)
     object_error = np.linalg.norm(cart["pred_object"] - cart["gt_object"], axis=-1)
     metrics = {
         "evaluated_rollout_steps": int(rollout.steps),
-        "joint_position_mse": float(np.mean((pred[:, :robot_dof] - gt[:, :robot_dof]) ** 2)),
-        "joint_velocity_mse": float(np.mean((pred[:, robot_dof:obj_start] - gt[:, robot_dof:obj_start]) ** 2)),
-        "object_state_mse": float(np.mean((pred[:, obj_start : obj_start + 13] - gt[:, obj_start : obj_start + 13]) ** 2)),
+        "joint_position_mse": float(np.mean((pred[:, layout.robot_q_slice] - gt[:, layout.robot_q_slice]) ** 2)),
+        "object_state_mse": float(np.mean((pred[:, layout.object_state_slice] - gt[:, layout.object_state_slice]) ** 2)),
         "object_position_mse": float(np.mean((cart["pred_object"] - cart["gt_object"]) ** 2)),
         f"{target}_position_rmse_m": float(np.sqrt(np.mean(target_error**2))),
         "object_position_rmse_m": float(np.sqrt(np.mean(object_error**2))),
@@ -439,6 +462,22 @@ def rollout_metrics(
         "object_position_error_std_m": float(np.std(object_error)),
         "object_position_error_max_m": float(np.max(object_error)),
     }
+    if layout.has_joint_vel:
+        metrics["joint_velocity_mse"] = float(
+            np.mean((pred[:, layout.robot_dq_slice] - gt[:, layout.robot_dq_slice]) ** 2)
+        )
+    if layout.object_quat_dim > 0:
+        metrics["object_quat_mse"] = float(
+            np.mean((pred[:, layout.object_quat_slice] - gt[:, layout.object_quat_slice]) ** 2)
+        )
+    if layout.has_object_lin_vel:
+        metrics["object_lin_vel_mse"] = float(
+            np.mean((pred[:, layout.object_lin_vel_slice] - gt[:, layout.object_lin_vel_slice]) ** 2)
+        )
+    if layout.has_object_ang_vel:
+        metrics["object_ang_vel_mse"] = float(
+            np.mean((pred[:, layout.object_ang_vel_slice] - gt[:, layout.object_ang_vel_slice]) ** 2)
+        )
     return metrics, cart
 
 
@@ -524,10 +563,31 @@ def per_horizon_episode_errors(
             )
             for h in range(rollout.steps):
                 target_err_by_h[h].append(float(np.linalg.norm(cart["pred_target"][h] - cart["gt_target"][h])))
+                layout = episode.state_layout
                 object_err_by_h[h].append(float(np.linalg.norm(cart["pred_object"][h] - cart["gt_object"][h])))
-                q_mse_by_h[h].append(float(np.mean((rollout.pred_states[h, :robot_dof] - rollout.gt_states[h, :robot_dof]) ** 2)))
-                qdot = slice(robot_dof, 2 * robot_dof)
-                dq_mse_by_h[h].append(float(np.mean((rollout.pred_states[h, qdot] - rollout.gt_states[h, qdot]) ** 2)))
+                q_mse_by_h[h].append(
+                    float(
+                        np.mean(
+                            (
+                                rollout.pred_states[h, layout.robot_q_slice]
+                                - rollout.gt_states[h, layout.robot_q_slice]
+                            )
+                            ** 2
+                        )
+                    )
+                )
+                if layout.has_joint_vel:
+                    dq_mse_by_h[h].append(
+                        float(
+                            np.mean(
+                                (
+                                    rollout.pred_states[h, layout.robot_dq_slice]
+                                    - rollout.gt_states[h, layout.robot_dq_slice]
+                                )
+                                ** 2
+                            )
+                        )
+                    )
 
     target_mean, target_std, count = _mean_std_count(target_err_by_h)
     object_mean, object_std, _ = _mean_std_count(object_err_by_h)
@@ -555,6 +615,8 @@ def load_episodes(
     torque_key: str = "applied_torque",
     subtract_env_origin: bool = True,
     dt: float = 0.02,
+    state_prediction_mode: str = "full",
+    state_layout: RobotObjectStateLayout | None = None,
     privileged_collision_observation: int = 0,
     privileged_collision_group: str = "privileged_collision",
     privileged_collision_pairs: str | None = None,
@@ -572,6 +634,8 @@ def load_episodes(
             torque_key=torque_key,
             subtract_env_origin=subtract_env_origin,
             dt=dt,
+            state_prediction_mode=state_prediction_mode,
+            state_layout=state_layout,
             privileged_collision_observation=privileged_collision_observation,
             privileged_collision_group=privileged_collision_group,
             privileged_collision_pairs=privileged_collision_pairs,

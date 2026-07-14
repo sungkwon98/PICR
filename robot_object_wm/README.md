@@ -1,18 +1,21 @@
 # Robot-Object World Model
 
 This package contains robot-object world-model training and evaluation code.
-The current default training config uses a pure MLP whole-state model:
+The current default training config uses an RWM position-level state:
 
 ```text
-model_type: MLP
+model_type: rwm
 history_len: 8
 rollout_horizon: 5
 action_type: torque
+state_prediction_mode: position
 ```
 
-Other wired model types are `split`, `whole`, and `rwm`, but the privileged
+Other wired model types are `split`, `whole`, and `MLP`, but the privileged
 collision observation described below is currently supported for `MLP` and
-`rwm` only.
+`rwm` only. The velocity-free `state_prediction_mode: position` layout is
+currently supported for `rwm` only; the DeLaN-based dynamics paths require
+velocity components in the state.
 
 ## Layout
 
@@ -23,6 +26,87 @@ robot_object_wm/
   models/        DeLaN robot dynamics, object MLP dynamics, WMDynamics
   training/      single training CLI, losses, W&B/checkpoints
 ```
+
+## Policy-free Franka cube-drop dataset
+
+`data/collect_franka_cube_drop.py` builds the inverse of the Lift task without
+loading or training a policy. It takes reachable held-cube poses from an
+existing Lift HDF5 file, initializes the Franka and cube at those poses, holds
+the arm fixed, and opens the gripper. The source dataset's randomized object
+mass/material and robot link masses are replayed by default. Because there is
+no policy to compensate gravity, the arm uses Isaac Lab's high-PD Franka gains
+during the release; they can be changed with `--arm-stiffness` and
+`--arm-damping`.
+
+The supplied `11003ep` dataset randomizes the cube reset pose, not the Franka
+reset joints. The collector therefore selects the highest valid closed-gripper
+state from each source rollout. This gives varied, physically reachable initial
+gripper poses that actually held the cube in the source simulation.
+
+Smoke test from the repository root (in the Isaac Lab Python environment):
+
+```bash
+python scripts/world_model/robot_object_wm/data/collect_franka_cube_drop.py \
+  --num-episodes 2 \
+  --num-envs 2 \
+  --episode-steps 50 \
+  --camera-width 64 \
+  --camera-height 64 \
+  --output-file /tmp/franka_drop_smoke.hdf5 \
+  --overwrite \
+  --headless
+```
+
+Full 11,003-episode collection with 128x128 front/left/right RGB:
+
+```bash
+DATASET_DIR=scripts/world_model/robot_object_wm/dataset
+SOURCE="$DATASET_DIR/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep.hdf5"
+OUTPUT="$DATASET_DIR/Franka_Lift_policy_free_cube_drop_multiview_11003ep.hdf5"
+python scripts/world_model/robot_object_wm/data/collect_franka_cube_drop.py \
+  --pose-source-hdf5 "$SOURCE" \
+  --output-file "$OUTPUT" \
+  --num-episodes 11003 \
+  --num-envs 8 \
+  --episode-steps 50 \
+  --camera-width 128 \
+  --camera-height 128 \
+  --headless
+```
+
+This full configuration has 75.6 GiB of raw RGB payload before gzip. The
+collector prints a storage estimate before starting, writes complete episodes
+incrementally, and supports restart with the same arguments plus `--resume`.
+
+Each `data/demo_N` contains the legacy `actions`, `obs`, `states`,
+`robot_torques`, `robot_dynamics`, `robot_joint_params`, `object_dynamics`, and
+`episode_physics_randomization` groups. New visual data is stored as:
+
+```text
+images/front       (T, H, W, 3) uint8
+images/left        (T, H, W, 3) uint8
+images/right       (T, H, W, 3) uint8
+initial_state/images/{front,left,right}  (1, H, W, 3) uint8
+camera_info/{front,left,right}/...
+```
+
+All time-series fields and RGB images are post-step and synchronized. The
+`initial_state` group is the held pre-release state. The existing collision
+augmentation is optional; if it is used, pass the real Lift support plane
+instead of `auto` because frame zero is in the air:
+
+```bash
+python scripts/world_model/robot_object_wm/data/augment_collision_info.py \
+  --dataset_file /path/to/Franka_Lift_policy_free_cube_drop_multiview_11003ep.hdf5 \
+  --dataset_dir '' \
+  --ground_z 0.0280570015 \
+  --output_suffix _collision_augmented \
+  --pairs object_ground object_left_finger object_right_finger object_gripper \
+  --nearest_points
+```
+
+Use `privileged_collision_observation: 0` when training directly from an
+unaugmented drop dataset.
 
 ## Train
 
@@ -43,10 +127,11 @@ The default training file is `configs/train_config.yaml`. Current defaults:
 
 ```text
 dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_10002ep_collision_augmented.hdf5
-model_type: MLP
+model_type: rwm
 history_len: 8
 rollout_horizon: 5
-privileged_collision_observation: 2
+state_prediction_mode: position
+privileged_collision_observation: 0
 batch_size: 256
 epochs: 200
 train_batch_fraction: 0.1
@@ -100,7 +185,8 @@ python training/train.py --config configs/train_config.yaml \
 
 ## Active Model
 
-The default `MLP` path uses `WholeMLPWMDynamics` in `models/whole_dynamics.py`.
+The default config uses the generic `RWMEnsemble` path in `models/rwm.py`.
+The `MLP` path uses `WholeMLPWMDynamics` in `models/whole_dynamics.py`.
 It predicts the next full state directly from:
 
 ```text
@@ -147,11 +233,17 @@ Object side:
 - `future_states`
 - `object_context` = mass + inertia + material
 
-Base state layout is 31D:
+The full base state layout is 31D:
 
 ```text
 joint_pos(9) + joint_vel(9) + object_pos(3) + object_quat(4)
 + object_lin_vel(3) + object_ang_vel(3)
+```
+
+For RWM training, `state_prediction_mode: position` uses a 16D state:
+
+```text
+joint_pos(9) + object_pos(3) + object_quat(4)
 ```
 
 `object_context` is 13D:
@@ -161,7 +253,7 @@ mass(1) + inertia(9) + material_properties(3)
 ```
 
 The dataset keeps `object_context` for logging/metadata compatibility. The
-current default `MLP` model uses `history_states` and current torque directly.
+default RWM model uses `history_states` and current torque directly.
 
 ### Privileged Collision Observation
 
@@ -188,6 +280,7 @@ object_gripper
 Training can append privileged collision information to each state with:
 
 ```yaml
+state_prediction_mode: full
 privileged_collision_observation: 2
 privileged_collision_group: privileged_collision
 privileged_collision_pairs: object_ground,object_left_finger,object_right_finger,object_gripper
@@ -203,7 +296,7 @@ Modes:
 3: signed distance + nearest_points
 ```
 
-With the default 4 pairs, state size becomes:
+With the default 4 pairs and the full 31D base state, state size becomes:
 
 ```text
 mode 0: 31
@@ -211,6 +304,19 @@ mode 1: 35
 mode 2: 35
 mode 3: 59
 ```
+
+With `state_prediction_mode: position`, use `privileged_collision_observation: 0`
+for the intended 16D position-level RWM state.
+
+For RWM, `rwm_config.yaml` also has:
+
+```yaml
+include_privileged_collision_in_loss: false
+```
+
+When false, privileged collision dims remain appended to the RWM state/input,
+but the direct RWM state regression loss masks those dims out. The model still
+predicts those dims because the recurrent rollout state shape includes them.
 
 Mode 3 is `signed_distance(4) + nearest_points(4 * 2 * 3 = 24)`, so it adds
 28 dims. `nearest_points` NaNs are converted to zeros before training. When

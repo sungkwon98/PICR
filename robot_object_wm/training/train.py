@@ -47,6 +47,7 @@ FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
 FIELD_CHOICES = {
     "model_type": ("split", "whole", "MLP", "mlp", "rwm"),
     "action_type": ("policy", "torque", "Torque"),
+    "state_prediction_mode": ("full", "position"),
     "torque_key": ("applied_torque", "computed_torque"),
     "privileged_collision_observation": (0, 1, 2, 3),
     "ode_solver": ("euler", "rk4"),
@@ -71,6 +72,7 @@ class TrainConfig:
     action_dim: int
     torque_dim: int
     action_type: str
+    state_prediction_mode: str
     torque_key: str
     privileged_collision_observation: int
     privileged_collision_group: str
@@ -165,6 +167,7 @@ class RWMConfig:
     sequence_loss_weight: float = 1.0
     bound_loss_weight: float = 0.01
     kl_loss_weight: float = 1.0
+    include_privileged_collision_in_loss: bool = True
     bootstrap: bool = False
 
 
@@ -382,6 +385,10 @@ def _normalize_model_type(model_type: str) -> str:
     return normalized
 
 
+def _normalize_state_prediction_mode(state_prediction_mode: str) -> str:
+    return rollout_dataset.normalize_state_prediction_mode(state_prediction_mode)
+
+
 def _model_name(cfg: TrainConfig) -> str:
     return "RWMEnsemble" if _normalize_model_type(cfg.model_type) == "rwm" else MODEL_NAME
 
@@ -398,17 +405,24 @@ def _privileged_collision_obs_dim(cfg: TrainConfig) -> int:
 
 
 def _state_layout(cfg: TrainConfig) -> rollout_dataset.RobotObjectWMStateLayout:
-    return rollout_dataset.RobotObjectWMStateLayout(
+    return rollout_dataset.make_robot_object_state_layout(
         robot_dof=cfg.robot_dof,
         action_dim=cfg.action_dim,
         torque_dim=cfg.torque_dim,
+        state_prediction_mode=_normalize_state_prediction_mode(cfg.state_prediction_mode),
         privileged_collision_obs_dim=_privileged_collision_obs_dim(cfg),
     )
 
 
 def _validate_privileged_collision_model_support(cfg: TrainConfig) -> None:
     _state_layout(cfg)
-    _normalize_model_type(cfg.model_type)
+    model_type = _normalize_model_type(cfg.model_type)
+    state_prediction_mode = _normalize_state_prediction_mode(cfg.state_prediction_mode)
+    if state_prediction_mode != "full" and model_type != "rwm":
+        raise ValueError(
+            "state_prediction_mode='position' is currently supported for model_type='rwm' only. "
+            "The split/whole/MLP dynamics paths still require velocity components in the state."
+        )
 
 
 def _apply_rwm_horizons(cfg: TrainConfig, rwm_cfg: RWMConfig | None) -> None:
@@ -495,6 +509,7 @@ def make_dataloaders(cfg: TrainConfig):
         "privileged_collision_group": cfg.privileged_collision_group,
         "privileged_collision_pairs": list(_privileged_collision_pairs(cfg)),
         "privileged_collision_obs_dim": layout.privileged_collision_obs_dim,
+        "state_prediction_mode": _normalize_state_prediction_mode(cfg.state_prediction_mode),
         "state_dim": layout.state_dim,
         "train_episodes_with_contact": train_dataset.episodes_with_contact,
         "val_episodes_with_contact": val_dataset.episodes_with_contact,
@@ -659,6 +674,19 @@ def _rwm_sequence_batch(
     return state_batch, action_batch, action_values
 
 
+def _rwm_state_loss_mask(
+    cfg: TrainConfig,
+    rwm_cfg: RWMConfig,
+    device: torch.device,
+) -> torch.Tensor | None:
+    layout = _state_layout(cfg)
+    if rwm_cfg.include_privileged_collision_in_loss or layout.privileged_collision_obs_dim <= 0:
+        return None
+    mask = torch.ones(layout.state_dim, dtype=torch.float32, device=device)
+    mask[layout.privileged_collision_slice] = 0.0
+    return mask
+
+
 def _is_finite(tensor: torch.Tensor) -> bool:
     return bool(torch.isfinite(tensor).all().detach().cpu().item())
 
@@ -703,6 +731,7 @@ def run_rwm_epoch(
     averager = MetricAverager()
     num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     phase = "train" if is_train else "val"
+    state_loss_mask = _rwm_state_loss_mask(cfg, rwm_cfg, device)
 
     for batch_idx, batch in enumerate(loader, start=1):
         if max_batches is not None and batch_idx > max_batches:
@@ -717,6 +746,7 @@ def run_rwm_epoch(
                 state_batch,
                 action_batch,
                 bootstrap=rwm_cfg.bootstrap,
+                state_loss_mask=state_loss_mask,
             )
             loss = (
                 rwm_cfg.state_loss_weight * state_loss
@@ -736,6 +766,9 @@ def run_rwm_epoch(
                         "bound_loss": bound_loss,
                         "kl_loss": kl_loss,
                         "loss": loss,
+                        "state_loss_mask": state_loss_mask
+                        if state_loss_mask is not None
+                        else state_batch.new_ones(state_batch.shape[-1]),
                     },
                 )
 
@@ -756,6 +789,8 @@ def run_rwm_epoch(
             "rwm_kl_loss": kl_loss.detach(),
             "action_abs_mean": action_values.abs().mean().detach(),
         }
+        if state_loss_mask is not None:
+            metrics["rwm_state_loss_active_dims"] = state_loss_mask.sum().detach()
         averager.update(metrics)
         averager.step()
 
@@ -862,7 +897,7 @@ def run_epoch(
             pred_future=pred_future,
             future_states=future_states,
             future_torques=future_torques,
-            robot_dof=cfg.robot_dof,
+            layout=_state_layout(cfg),
         )
         metrics.update(rollout_metrics)
         if context_metrics:
@@ -884,18 +919,23 @@ def _step_metrics(
     pred_future,
     future_states,
     future_torques,
-    robot_dof: int,
+    layout,
 ) -> dict[str, torch.Tensor]:
-    robot_state_dim = 2 * robot_dof
-    one_step_q = torch.nn.functional.mse_loss(pred_future[:, 0, :robot_dof], future_states[:, 0, :robot_dof])
-    one_step_object_pos = torch.nn.functional.mse_loss(
-        pred_future[:, 0, robot_state_dim : robot_state_dim + 3],
-        future_states[:, 0, robot_state_dim : robot_state_dim + 3],
+    one_step_q = torch.nn.functional.mse_loss(
+        pred_future[:, 0, layout.robot_q_slice],
+        future_states[:, 0, layout.robot_q_slice],
     )
-    final_step_q = torch.nn.functional.mse_loss(pred_future[:, -1, :robot_dof], future_states[:, -1, :robot_dof])
+    one_step_object_pos = torch.nn.functional.mse_loss(
+        pred_future[:, 0, layout.object_pos_slice],
+        future_states[:, 0, layout.object_pos_slice],
+    )
+    final_step_q = torch.nn.functional.mse_loss(
+        pred_future[:, -1, layout.robot_q_slice],
+        future_states[:, -1, layout.robot_q_slice],
+    )
     final_step_object_pos = torch.nn.functional.mse_loss(
-        pred_future[:, -1, robot_state_dim : robot_state_dim + 3],
-        future_states[:, -1, robot_state_dim : robot_state_dim + 3],
+        pred_future[:, -1, layout.object_pos_slice],
+        future_states[:, -1, layout.object_pos_slice],
     )
     metrics = {
         "loss": loss.detach(),

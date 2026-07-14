@@ -1,4 +1,4 @@
-# Default TrainConfig for robot-object world-model training.
+# Default TrainConfig for robot-object RWM training.
 
 dataset_dir: ../dataset
 dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
@@ -6,8 +6,8 @@ dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_con
 # split: robot DeLaN + object MLP
 # whole: one DeLaN over robot + object generalized coordinates
 # MLP: pure MLP whole-state model; delan_use_film enables FiLM on the MLP
-# rwm: RWMEnsemble whole-dynamics model configured by rwm_config.yaml
-model_type: MLP
+# rwm: RWMEnsemble dynamics model configured by rwm_config.yaml
+model_type: rwm
 rwm_config: rwm_config.yaml
 
 delan_use_history : false
@@ -18,10 +18,13 @@ robot_dof: 9
 action_dim: 8
 torque_dim: 9
 action_type: torque  # policy or torque
+# full: joint_pos + joint_vel + object_pos + object_quat + object_lin_vel + object_ang_vel
+# position: joint_pos + object_pos + object_quat
+state_prediction_mode: position
 torque_key: applied_torque
 
-# Privileged collision observation appended to state. Current default uses
-# signed distance, giving state_dim = 31 + 4 collision pairs = 35.
+# Privileged collision observation appended to state. Keep this at 0 for a
+# position-only RWM state_dim = joint_pos(9) + object_pos(3) + object_quat(4) = 16.
 # 0: none
 # 1: collision flag
 # 2: signed distance

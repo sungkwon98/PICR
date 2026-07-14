@@ -6,10 +6,13 @@ forecast_horizon: 5
 rnn_num_layers: 2
 rnn_hidden_size: 256
 state_mean_head: [128]
-state_logstd_head: [128]
+state_logstd_head:  #[128]
 
 state_loss_weight: 1.0
 sequence_loss_weight: 1.0
 bound_loss_weight: 0.01
 kl_loss_weight: 1.0
+# false keeps privileged collision observations in the RWM state/input, but
+# excludes those appended dims from RWM state_loss.
+include_privileged_collision_in_loss: true
 bootstrap: false

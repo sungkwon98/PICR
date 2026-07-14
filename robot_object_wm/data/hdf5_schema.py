@@ -5,6 +5,7 @@ from typing import Tuple
 
 
 EpisodeRef = Tuple[str, str]
+STATE_PREDICTION_MODE_CHOICES = ("full", "position")
 DEFAULT_PRIVILEGED_COLLISION_PAIRS = (
     "object_ground",
     "object_left_finger",
@@ -31,9 +32,17 @@ def privileged_collision_observation_dim(mode: int, pair_count: int) -> int:
     return pair_count + pair_count * 2 * 3
 
 
+def normalize_state_prediction_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in STATE_PREDICTION_MODE_CHOICES:
+        raise ValueError(f"state_prediction_mode must be one of {STATE_PREDICTION_MODE_CHOICES}.")
+    return normalized
+
+
 @dataclass(frozen=True)
 class RobotObjectStateLayout:
     robot_dof: int = 9
+    joint_vel_dim: int | None = None
     action_dim: int = 8
     torque_dim: int = 9
     object_pos_dim: int = 3
@@ -45,9 +54,13 @@ class RobotObjectStateLayout:
     object_mass_dim: int = 1
     privileged_collision_obs_dim: int = 0
 
+    def __post_init__(self) -> None:
+        if self.joint_vel_dim is None:
+            object.__setattr__(self, "joint_vel_dim", int(self.robot_dof))
+
     @property
     def robot_state_dim(self) -> int:
-        return 2 * self.robot_dof
+        return self.robot_dof + int(self.joint_vel_dim or 0)
 
     @property
     def object_state_dim(self) -> int:
@@ -70,6 +83,60 @@ class RobotObjectStateLayout:
     def state_dim(self) -> int:
         return self.base_state_dim + self.privileged_collision_obs_dim
 
+    @property
+    def robot_q_slice(self) -> slice:
+        return slice(0, self.robot_dof)
+
+    @property
+    def robot_dq_slice(self) -> slice:
+        start = self.robot_dof
+        return slice(start, start + int(self.joint_vel_dim or 0))
+
+    @property
+    def object_start(self) -> int:
+        return self.robot_state_dim
+
+    @property
+    def object_pos_slice(self) -> slice:
+        start = self.object_start
+        return slice(start, start + self.object_pos_dim)
+
+    @property
+    def object_quat_slice(self) -> slice:
+        start = self.object_pos_slice.stop
+        return slice(start, start + self.object_quat_dim)
+
+    @property
+    def object_lin_vel_slice(self) -> slice:
+        start = self.object_quat_slice.stop
+        return slice(start, start + self.object_lin_vel_dim)
+
+    @property
+    def object_ang_vel_slice(self) -> slice:
+        start = self.object_lin_vel_slice.stop
+        return slice(start, start + self.object_ang_vel_dim)
+
+    @property
+    def object_state_slice(self) -> slice:
+        return slice(self.object_start, self.object_start + self.object_state_dim)
+
+    @property
+    def privileged_collision_slice(self) -> slice:
+        start = self.object_state_slice.stop
+        return slice(start, start + self.privileged_collision_obs_dim)
+
+    @property
+    def has_joint_vel(self) -> bool:
+        return int(self.joint_vel_dim or 0) > 0
+
+    @property
+    def has_object_lin_vel(self) -> bool:
+        return self.object_lin_vel_dim > 0
+
+    @property
+    def has_object_ang_vel(self) -> bool:
+        return self.object_ang_vel_dim > 0
+
     def to_dict(self) -> dict[str, int]:
         return asdict(self) | {
             "robot_state_dim": self.robot_state_dim,
@@ -78,6 +145,36 @@ class RobotObjectStateLayout:
             "base_state_dim": self.base_state_dim,
             "state_dim": self.state_dim,
         }
+
+
+def make_robot_object_state_layout(
+    *,
+    robot_dof: int = 9,
+    action_dim: int = 8,
+    torque_dim: int = 9,
+    state_prediction_mode: str = "full",
+    privileged_collision_obs_dim: int = 0,
+) -> RobotObjectStateLayout:
+    mode = normalize_state_prediction_mode(state_prediction_mode)
+    if mode == "full":
+        return RobotObjectStateLayout(
+            robot_dof=robot_dof,
+            joint_vel_dim=robot_dof,
+            action_dim=action_dim,
+            torque_dim=torque_dim,
+            object_lin_vel_dim=3,
+            object_ang_vel_dim=3,
+            privileged_collision_obs_dim=privileged_collision_obs_dim,
+        )
+    return RobotObjectStateLayout(
+        robot_dof=robot_dof,
+        joint_vel_dim=0,
+        action_dim=action_dim,
+        torque_dim=torque_dim,
+        object_lin_vel_dim=0,
+        object_ang_vel_dim=0,
+        privileged_collision_obs_dim=privileged_collision_obs_dim,
+    )
 
 
 class Hdf5Groups:

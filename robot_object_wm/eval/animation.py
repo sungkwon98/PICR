@@ -101,6 +101,7 @@ def render_checkpoint_animation(
         subtract_env_origin=cfg.subtract_env_origin,
         max_frames=max_frames,
         dt=cfg.dt,
+        state_prediction_mode=getattr(cfg, "state_prediction_mode", "full"),
         privileged_collision_observation=cfg.privileged_collision_observation,
         privileged_collision_group=cfg.privileged_collision_group,
         privileged_collision_pairs=cfg.privileged_collision_pairs,

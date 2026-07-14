@@ -15,6 +15,8 @@ from .hdf5_schema import (
     EpisodeRef,
     Hdf5Groups,
     RobotObjectStateLayout,
+    make_robot_object_state_layout,
+    normalize_state_prediction_mode,
     parse_privileged_collision_pairs,
     privileged_collision_observation_dim,
 )
@@ -234,7 +236,7 @@ class RobotObjectWMRolloutDataset(Dataset):
                     )
 
                     joint_pos = np.asarray(obs["joint_pos"], dtype=np.float32)[:, : self.layout.robot_dof]
-                    joint_vel = np.asarray(obs["joint_vel"], dtype=np.float32)[:, : self.layout.robot_dof]
+                    joint_vel = np.asarray(obs["joint_vel"], dtype=np.float32)[:, : int(self.layout.joint_vel_dim or 0)]
                     actions = np.asarray(episode[Hdf5Groups.ACTIONS], dtype=np.float32)[:, : self.layout.action_dim]
                     torques = np.asarray(episode[Hdf5Groups.ROBOT_TORQUES][self.torque_key], dtype=np.float32)[
                         :, : self.layout.torque_dim

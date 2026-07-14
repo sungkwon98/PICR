@@ -230,7 +230,7 @@ class RWMEnsemble(nn.Module):
         epistemic_uncertainty = state_means.std(dim=0).sum(dim=1) if self.ensemble_size > 1 else torch.zeros(output_state_means.shape[0], device=self.device)
         return output_state_means, aleatoric_uncertainty, epistemic_uncertainty
 
-    def compute_loss(self, state_batch, action_batch, bootstrap=False):
+    def compute_loss(self, state_batch, action_batch, bootstrap=False, state_loss_mask=None):
         state_losses = []
         sequence_losses = []
         bound_losses = []
@@ -244,7 +244,10 @@ class RWMEnsemble(nn.Module):
                 ids = torch.arange(0, state_batch.shape[0], device=self.device)
             
             state_loss, sequence_loss, bound_loss, kl_loss = self.compute_state_loss(
-                self.state_heads[i], state_batch[ids], action_batch[ids]
+                self.state_heads[i],
+                state_batch[ids],
+                action_batch[ids],
+                state_loss_mask=state_loss_mask,
             )
             
             state_losses.append(state_loss.unsqueeze(0))
@@ -259,7 +262,7 @@ class RWMEnsemble(nn.Module):
         kl_loss = torch.mean(torch.cat(kl_losses, dim=0), dim=0)
         return state_loss, sequence_loss, bound_loss, kl_loss
 
-    def compute_state_loss(self, head, state_batch, action_batch):
+    def compute_state_loss(self, head, state_batch, action_batch, state_loss_mask=None):
         forecast_horizon = state_batch.shape[1] - self.history_horizon
         x_state_batch = state_batch[:, :self.history_horizon]
         state_losses = []
@@ -283,7 +286,12 @@ class RWMEnsemble(nn.Module):
                 x_action_batch = action_batch[:, i + 1:self.history_horizon + i + 1]
             
             state_mean_pred, state_std_pred = head.forward(self.state_base.forward(x_state_batch, x_action_batch), x_state_batch)
-            state_loss, sequence_loss = self.compute_regression_loss(state_mean_pred, state_std_pred, state_target)
+            state_loss, sequence_loss = self.compute_regression_loss(
+                state_mean_pred,
+                state_std_pred,
+                state_target,
+                state_loss_mask=state_loss_mask,
+            )
             bound_loss = self.compute_bound_loss(head) if head.output_std else torch.tensor(0.0, device=self.device)
             kl_loss = self.state_base.kl_loss if self.architecture_config["type"] == "rssm" else torch.tensor(0.0, device=self.device)
             
@@ -313,7 +321,8 @@ class RWMEnsemble(nn.Module):
         kl_loss = torch.mean(torch.cat(kl_losses, dim=0), dim=0)
         return state_loss, sequence_loss, bound_loss, kl_loss
 
-    def compute_regression_loss(self, state_mean_pred, state_std_pred, state_target, loss_type="mse"):
+    def compute_regression_loss(self, state_mean_pred, state_std_pred, state_target, loss_type="mse", state_loss_mask=None):
+        mask = self._loss_mask(state_loss_mask, state_mean_pred)
         if loss_type == "mse":
             if self.prediction_type == "sequence":
                 state_mean_pred_seq, state_mean_pred = state_mean_pred[:, :-1], state_mean_pred[:, -1]
@@ -322,11 +331,11 @@ class RWMEnsemble(nn.Module):
                 state_pred_seq = torch.randn_like(state_mean_pred_seq, device=self.device) * state_std_pred_seq + state_mean_pred_seq
                 state_pred_seq = state_pred_seq.flatten(0, 1)
                 state_target_seq = state_target_seq.flatten(0, 1)
-                sequence_loss = torch.sum(torch.square(state_pred_seq - state_target_seq), dim=1).mean(dim=0)
+                sequence_loss = self._masked_square_loss(state_pred_seq, state_target_seq, mask)
             else:
                 sequence_loss = torch.tensor(0.0, device=self.device)
             state_pred = torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred
-            state_loss = torch.sum(torch.square(state_pred - state_target), dim=1).mean(dim=0)
+            state_loss = self._masked_square_loss(state_pred, state_target, mask)
             return state_loss, sequence_loss
         elif loss_type == "gaussian_nll":
             if self.prediction_type == "sequence":
@@ -336,13 +345,33 @@ class RWMEnsemble(nn.Module):
                 state_mean_pred_seq = state_mean_pred_seq.flatten(0, 1)
                 state_std_pred_seq = state_std_pred_seq.flatten(0, 1)
                 state_target_seq = state_target_seq.flatten(0, 1)
-                sequence_loss = nn.GaussianNLLLoss()(state_mean_pred_seq, state_target_seq, state_std_pred_seq ** 2)
+                sequence_loss = self._masked_gaussian_nll_loss(state_mean_pred_seq, state_target_seq, state_std_pred_seq, mask)
             else:
                 sequence_loss = torch.tensor(0.0, device=self.device)
-            state_loss = nn.GaussianNLLLoss()(state_mean_pred, state_target, state_std_pred ** 2)
+            state_loss = self._masked_gaussian_nll_loss(state_mean_pred, state_target, state_std_pred, mask)
             return state_loss, sequence_loss
         else:
             raise ValueError("Invalid loss type.")
+
+    def _loss_mask(self, state_loss_mask, reference):
+        if state_loss_mask is None:
+            return None
+        mask = torch.as_tensor(state_loss_mask, device=reference.device, dtype=reference.dtype)
+        if mask.shape[-1] != self.state_dim:
+            raise ValueError(f"Expected state_loss_mask dim {self.state_dim}, got {mask.shape[-1]}.")
+        return mask.reshape(1, self.state_dim)
+
+    def _masked_square_loss(self, pred, target, mask):
+        diff = pred - target
+        if mask is not None:
+            diff = diff * mask
+        return torch.sum(torch.square(diff), dim=-1).mean(dim=0)
+
+    def _masked_gaussian_nll_loss(self, mean, target, std, mask):
+        loss = nn.functional.gaussian_nll_loss(mean, target, std ** 2, reduction="none")
+        if mask is not None:
+            loss = loss * mask
+        return torch.sum(loss, dim=-1).mean(dim=0)
         
     def compute_bound_loss(self, head):
         return torch.mean(head.state_max_logstd) - torch.mean(head.state_min_logstd)

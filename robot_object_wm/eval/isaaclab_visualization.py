@@ -209,6 +209,7 @@ def main() -> str:
         torque_key=wm_cfg.torque_key,
         subtract_env_origin=wm_cfg.subtract_env_origin,
         dt=wm_cfg.dt,
+        state_prediction_mode=getattr(wm_cfg, "state_prediction_mode", "full"),
         privileged_collision_observation=wm_cfg.privileged_collision_observation,
         privileged_collision_group=wm_cfg.privileged_collision_group,
         privileged_collision_pairs=wm_cfg.privileged_collision_pairs,
@@ -456,7 +457,6 @@ def make_world_model_track(
     wm_cfg,
     start_t: int,
 ) -> RenderTrack:
-    robot_dof = int(wm_cfg.robot_dof)
     frame_count = int(pred_states.shape[0]) + 1
     src_indices = np.arange(start_t, start_t + frame_count, dtype=np.int64)
 
@@ -470,22 +470,33 @@ def make_world_model_track(
     if pred_states.size == 0:
         return RenderTrack(robot_root_pose, robot_root_velocity, joint_pos, joint_vel, object_pose, object_velocity)
 
-    object_offset = 2 * robot_dof
-    joint_offset = wm_episode.joint_pos_abs[start_t] - wm_episode.state[start_t, :robot_dof]
-    joint_pos[1:] = fit_last_dim(pred_states[:, :robot_dof] + joint_offset[None, :], joint_pos.shape[-1])
-    joint_vel[1:] = fit_last_dim(pred_states[:, robot_dof:object_offset], joint_vel.shape[-1])
+    layout = wm_episode.state_layout
+    joint_offset = wm_episode.joint_pos_abs[start_t] - wm_episode.state[start_t, layout.robot_q_slice]
+    pred_joint_pos = pred_states[:, layout.robot_q_slice] + joint_offset[None, :]
+    joint_pos[1:] = fit_last_dim(pred_joint_pos, joint_pos.shape[-1])
+    if layout.has_joint_vel:
+        joint_vel[1:] = fit_last_dim(pred_states[:, layout.robot_dq_slice], joint_vel.shape[-1])
+    else:
+        joint_vel[1:] = fit_last_dim(
+            finite_difference_rows(joint_pos[:frame_count], float(wm_cfg.dt))[1:],
+            joint_vel.shape[-1],
+        )
 
-    pred_object_pos = pred_states[:, object_offset : object_offset + 3]
+    pred_object_pos = pred_states[:, layout.object_pos_slice]
     if bool(wm_cfg.subtract_env_origin):
         pred_object_pos = pred_object_pos + visual_episode.source_origin_w[None, :]
-    pred_object_quat = normalize_quat_array(pred_states[:, object_offset + 3 : object_offset + 7])
-    pred_object_lin_vel = pred_states[:, object_offset + 7 : object_offset + 10]
-    pred_object_ang_vel = pred_states[:, object_offset + 10 : object_offset + 13]
+    pred_object_quat = normalize_quat_array(pred_states[:, layout.object_quat_slice])
 
     object_pose[1:, :3] = pred_object_pos
     object_pose[1:, 3:7] = pred_object_quat
-    object_velocity[1:, :3] = pred_object_lin_vel
-    object_velocity[1:, 3:6] = pred_object_ang_vel
+    if layout.has_object_lin_vel:
+        object_velocity[1:, :3] = pred_states[:, layout.object_lin_vel_slice]
+    else:
+        object_velocity[1:, :3] = finite_difference_rows(object_pose[:frame_count, :3], float(wm_cfg.dt))[1:]
+    if layout.has_object_ang_vel:
+        object_velocity[1:, 3:6] = pred_states[:, layout.object_ang_vel_slice]
+    else:
+        object_velocity[1:, 3:6] = angular_velocity_from_quat_rows(object_pose[:frame_count, 3:7], float(wm_cfg.dt))[1:]
     return RenderTrack(robot_root_pose, robot_root_velocity, joint_pos, joint_vel, object_pose, object_velocity)
 
 
@@ -987,6 +998,53 @@ def normalize_quat_array(quat: np.ndarray) -> np.ndarray:
     if np.any(bad):
         out[bad] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     return out.astype(np.float32)
+
+
+def finite_difference_rows(values: np.ndarray, dt: float) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    out = np.zeros_like(arr, dtype=np.float32)
+    if arr.shape[0] <= 1:
+        return out
+    safe_dt = max(float(dt), 1.0e-8)
+    out[1:] = (arr[1:] - arr[:-1]) / safe_dt
+    out[0] = out[1]
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def angular_velocity_from_quat_rows(quat: np.ndarray, dt: float) -> np.ndarray:
+    q = normalize_quat_array(quat)
+    out = np.zeros((q.shape[0], 3), dtype=np.float32)
+    if q.shape[0] <= 1:
+        return out
+    safe_dt = max(float(dt), 1.0e-8)
+    q_prev_inv = q[:-1].copy()
+    q_prev_inv[:, 1:] *= -1.0
+    dq = quat_multiply_rows(q[1:], q_prev_inv)
+    dq = np.where(dq[:, :1] < 0.0, -dq, dq)
+    xyz = dq[:, 1:]
+    xyz_norm = np.linalg.norm(xyz, axis=-1, keepdims=True)
+    w = np.clip(dq[:, :1], -1.0, 1.0)
+    angle = 2.0 * np.arctan2(xyz_norm, w)
+    axis = np.divide(xyz, np.maximum(xyz_norm, 1.0e-8), out=np.zeros_like(xyz), where=xyz_norm > 1.0e-8)
+    out[1:] = axis * angle / safe_dt
+    out[0] = out[1]
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def quat_multiply_rows(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    a = normalize_quat_array(lhs)
+    b = normalize_quat_array(rhs)
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return np.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        axis=-1,
+    ).astype(np.float32)
 
 
 def rebase_pose(pose_w: np.ndarray, source_origin_w: np.ndarray, target_origin_w: np.ndarray) -> np.ndarray:

@@ -24,6 +24,6 @@ venv/
 # Logs and temporary files
 *.log
 *.tmp
-
+robot_object_wm/dataset/
 # OS/editor noise
 .DS_Store
