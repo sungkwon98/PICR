@@ -13,7 +13,7 @@ pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p
 rigidformer_config: hybrid_rigidformer_config.yaml
 hybrid_robot_model_type: rwm
 hybrid_rollout_feedback_mode: robot_native
-hybrid_gripper_pointcloud_mode: gt
+hybrid_gripper_pointcloud_mode: predicted_fk # gt or predicted_fk
 robot_loss_weight: 1.0
 rigidformer_loss_weight: 1.0
 

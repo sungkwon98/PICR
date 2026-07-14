@@ -98,6 +98,11 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument("--episode-start", type=int, default=0)
     parser.add_argument("--num-episodes", type=int, default=0, help="0 means all episodes from episode-start.")
     parser.add_argument(
+        "--cycle-episodes",
+        action="store_true",
+        help="Cycle selected source episodes if --num-episodes exceeds the number of available source episodes.",
+    )
+    parser.add_argument(
         "--step-policy",
         choices=("strict", "min"),
         default="strict",
@@ -387,12 +392,45 @@ def episode_names_from_source(data: h5py.Group) -> list[str]:
     return sorted((name for name in data if name.startswith("demo_")), key=numeric_demo_key)
 
 
+def select_episode_names(args: argparse.Namespace, all_episode_names: list[str]) -> list[str]:
+    start = int(args.episode_start)
+    if start < 0 or start >= len(all_episode_names):
+        raise ValueError(f"--episode-start={start} out of range for {len(all_episode_names)} source episodes.")
+    available = all_episode_names[start:]
+    requested = len(available) if int(args.num_episodes) <= 0 else int(args.num_episodes)
+    if requested <= len(available):
+        return available[:requested]
+    if not bool(args.cycle_episodes):
+        raise ValueError(
+            f"Requested {requested} episodes from {len(available)} available. "
+            "Pass --cycle-episodes to repeat source episodes."
+        )
+    repeats, remainder = divmod(requested, len(available))
+    names = available * repeats + available[:remainder]
+    print(
+        f"[WARN] Only {len(available)} source episodes available from episode-start={start}; "
+        f"cycling to make {requested} output episodes."
+    )
+    return names
+
+
 def get_episode_steps(episode: h5py.Group) -> int:
     if "states/rigid_object/object/root_pose" in episode:
         return int(episode["states/rigid_object/object/root_pose"].shape[0])
     if "object_dynamics/root_pos_w" in episode:
         return int(episode["object_dynamics/root_pos_w"].shape[0])
     raise KeyError("Episode has no cube root pose trajectory.")
+
+
+def infer_control_dt(source: h5py.File, source_attrs: dict[str, Any]) -> float:
+    if "control_dt" in source_attrs:
+        return float(source_attrs["control_dt"])
+    try:
+        env_args = json.loads(str(source["data"].attrs.get("env_args", "{}")))
+        sim_args = env_args.get("sim_args", {})
+        return float(sim_args["dt"]) * int(sim_args.get("decimation", 1))
+    except Exception:
+        return 0.02
 
 
 def cube_pose_trajectory(episode: h5py.Group) -> np.ndarray:
@@ -567,8 +605,11 @@ def create_or_open_output(
             if key in source.attrs:
                 value = source.attrs[key]
                 source_attrs[key] = value.item() if hasattr(value, "item") else value
+        if "data" in source and "env_args" in source["data"].attrs:
+            source_attrs["env_args"] = str(source["data"].attrs["env_args"])
 
-    control_dt = float(source_attrs.get("control_dt", 0.02))
+    with h5py.File(args.input_file, "r", locking=False) as source:
+        control_dt = infer_control_dt(source, source_attrs)
     file.attrs["schema_version"] = "franka_rigidformer_mesh_pointcloud_v1"
     file.attrs["source_hdf5"] = os.path.abspath(args.input_file)
     file.attrs["rigidformer_pointcloud_config"] = json.dumps(
@@ -593,6 +634,7 @@ def create_or_open_output(
             "hand_mesh": str(hand_mesh_path),
             "finger_mesh": str(finger_mesh_path),
             "step_policy": str(args.step_policy),
+            "cycle_episodes": bool(args.cycle_episodes),
             "steps": int(steps),
             "source_episode_steps_min": int(np.min(source_episode_steps)),
             "source_episode_steps_max": int(np.max(source_episode_steps)),
@@ -622,11 +664,7 @@ def main() -> str:
     with h5py.File(args.input_file, "r", locking=False) as source:
         data = source["data"]
         all_episode_names = episode_names_from_source(data)
-        start = int(args.episode_start)
-        stop = len(all_episode_names) if int(args.num_episodes) <= 0 else min(
-            len(all_episode_names), start + int(args.num_episodes)
-        )
-        episode_names = all_episode_names[start:stop]
+        episode_names = select_episode_names(args, all_episode_names)
         if not episode_names:
             raise ValueError("No episodes selected.")
         source_episode_steps = np.asarray([get_episode_steps(data[name]) for name in episode_names], dtype=np.int32)

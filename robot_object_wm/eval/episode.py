@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import json
 import os
@@ -162,6 +163,30 @@ def load_episode_pointcloud_data(
         gripper_part_ids=gripper_part_ids,
         control_dt=control_dt,
     )
+
+
+def _cached_episode_pointcloud_data(
+    model: torch.nn.Module,
+    pointcloud_file: str,
+    episode_name: str,
+    *,
+    max_points: int,
+) -> EpisodePointCloudData:
+    key = (os.path.abspath(pointcloud_file), episode_name, int(max_points))
+    cache = getattr(model, "_hybrid_pointcloud_episode_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(model, "_hybrid_pointcloud_episode_cache", cache)
+    if key in cache:
+        value = cache.pop(key)
+        cache[key] = value
+        return value
+
+    value = load_episode_pointcloud_data(pointcloud_file, episode_name, max_points=max_points)
+    cache[key] = value
+    while len(cache) > 16:
+        cache.popitem(last=False)
+    return value
 
 
 def load_episode_data(
@@ -428,7 +453,8 @@ def _rollout_hybrid_episode(
     pointcloud_file = getattr(model, "pointcloud_file", None)
     if not pointcloud_file:
         raise ValueError("Hybrid episode rollout requires model.pointcloud_file.")
-    pc_episode = load_episode_pointcloud_data(
+    pc_episode = _cached_episode_pointcloud_data(
+        model,
         pointcloud_file,
         episode.name,
         max_points=int(getattr(model, "rigidformer_max_points", 1024)),
