@@ -1,14 +1,21 @@
 # Default TrainConfig for robot-object RWM training.
 
-dataset_dir: ../dataset
-dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
+dataset_dir: ../../rigidformer/data/franka
+dataset_file: ../../rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
 
 # split: robot DeLaN + object MLP
 # whole: one DeLaN over robot + object generalized coordinates
 # MLP: pure MLP whole-state model; delan_use_film enables FiLM on the MLP
 # rwm: RWMEnsemble dynamics model configured by rwm_config.yaml
-model_type: rwm
+model_type: hybrid
 rwm_config: rwm_config.yaml
+pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p_11003ep.hdf5
+rigidformer_config: hybrid_rigidformer_config.yaml
+hybrid_robot_model_type: rwm
+hybrid_rollout_feedback_mode: robot_native
+hybrid_gripper_pointcloud_mode: gt
+robot_loss_weight: 1.0
+rigidformer_loss_weight: 1.0
 
 delan_use_history : false
 
@@ -20,7 +27,7 @@ torque_dim: 9
 action_type: torque  # policy or torque
 # full: joint_pos + joint_vel + object_pos + object_quat + object_lin_vel + object_ang_vel
 # position: joint_pos + object_pos + object_quat
-state_prediction_mode: position
+state_prediction_mode: full
 torque_key: applied_torque
 
 # Privileged collision observation appended to state. Keep this at 0 for a
@@ -98,6 +105,8 @@ wandb_artifacts: true
 #   <output_dir>/<run_name>/<eval_output_dir>/
 eval_after_train: true
 eval_fail_on_error: false
+# 0 disables periodic rendering. Positive values render/log every N epochs.
+render_every: 0
 eval_output_dir: eval
 eval_split: val
 eval_batch_size:
@@ -112,11 +121,14 @@ eval_start_t: 25
 eval_rollout_steps: 25
 eval_target: gripper
 
-eval_prediction_metrics: true
-eval_pred_horizon: 10
-eval_prediction_max_episodes: 10
+eval_prediction_metrics: false
+eval_pred_horizon: 3
+eval_prediction_max_episodes: 1
 
 eval_video: true
+eval_isaaclab_video: false
+eval_isaaclab_config: isaaclab_visualization.yaml
+eval_isaaclab_output:
 eval_fps: 25
 eval_max_frames: 250
 eval_collision_info: true

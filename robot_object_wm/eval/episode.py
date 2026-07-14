@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from typing import Any
 
@@ -10,6 +11,7 @@ import torch
 from robot_object_wm.data import rollout_dataset
 from robot_object_wm.data.dataset import h5_open
 from robot_object_wm.data.hdf5_schema import RobotObjectStateLayout
+from robot_object_wm.models.hybrid import HybridRigidFormerWMDynamics
 from robot_object_wm.models.rwm import RWMEnsemble
 from robot_object_wm.models.utils import FrankaForwardKinematics
 
@@ -26,6 +28,7 @@ class EpisodeData:
     object_pos: np.ndarray
     object_quat: np.ndarray
     state_layout: RobotObjectStateLayout
+    source_origin: np.ndarray
     dt: float
 
     @property
@@ -46,6 +49,32 @@ class EpisodeRollout:
         return int(self.pred_states.shape[0])
 
 
+def _empty_rollout(episode: EpisodeData, *, start_t: int, reason: str) -> EpisodeRollout:
+    empty = np.empty((0, episode.state.shape[-1]), dtype=np.float32)
+    return EpisodeRollout(
+        pred_states=empty,
+        gt_states=empty,
+        start_t=start_t,
+        failed_step=0,
+        failure_reason=reason,
+    )
+
+
+@dataclass
+class EpisodePointCloudData:
+    name: str
+    object_points: np.ndarray
+    vertex_properties: np.ndarray
+    object_point_lens: np.ndarray
+    loss_object_mask: np.ndarray
+    gripper_part_ids: np.ndarray
+    control_dt: float
+
+    @property
+    def T(self) -> int:
+        return int(self.object_points.shape[0])
+
+
 def list_episode_names(dataset_file: str) -> list[str]:
     if not os.path.isfile(dataset_file):
         raise FileNotFoundError(f"Dataset file not found: {dataset_file}")
@@ -64,6 +93,75 @@ def resolve_episode_name(dataset_file: str, episode_index: int = 0, episode_name
     if episode_index < 0 or episode_index >= len(names):
         raise IndexError(f"episode_index {episode_index} out of [0, {len(names)})")
     return names[episode_index]
+
+
+def _decode_hdf5_strings(values) -> list[str]:
+    return [value.decode("utf-8") if isinstance(value, bytes) else str(value) for value in values]
+
+
+def load_episode_pointcloud_data(
+    pointcloud_file: str,
+    episode_name: str,
+    *,
+    max_points: int,
+) -> EpisodePointCloudData:
+    if not pointcloud_file or not os.path.isfile(pointcloud_file):
+        raise FileNotFoundError(f"Pointcloud file not found: {pointcloud_file}")
+    with h5_open(pointcloud_file) as file:
+        data = file["data"]
+        points_ds = data["object_points"]
+        if points_ds.ndim != 5 or points_ds.shape[-1] != 3:
+            raise ValueError("/data/object_points must have shape (episodes, steps, objects, points, 3).")
+        if "episode_names" in data:
+            names = _decode_hdf5_strings(data["episode_names"][()])
+        else:
+            names = [f"demo_{index}" for index in range(points_ds.shape[0])]
+        try:
+            episode_index = names.index(episode_name)
+        except ValueError as exc:
+            raise KeyError(f"Episode '{episode_name}' not found in pointcloud file {pointcloud_file}.") from exc
+        point_count = min(int(max_points), int(points_ds.shape[-2]))
+        object_points = np.asarray(points_ds[episode_index, :, :, :point_count, :], dtype=np.float32)
+        object_points = np.nan_to_num(object_points, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        if "vertex_properties" in data:
+            props_ds = data["vertex_properties"]
+            vertex_properties = np.asarray(props_ds if props_ds.ndim == 2 else props_ds[episode_index], dtype=np.float32)
+        else:
+            vertex_properties = np.zeros((object_points.shape[1], 3), dtype=np.float32)
+            if object_points.shape[1] > 0:
+                vertex_properties[0] = np.asarray([1.0, 0.0, 1.0], dtype=np.float32)
+            if object_points.shape[1] > 1:
+                vertex_properties[1] = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+        if "loss_object_mask" in data:
+            mask_ds = data["loss_object_mask"]
+            loss_object_mask = np.asarray(mask_ds if mask_ds.ndim == 1 else mask_ds[episode_index], dtype=bool)
+        else:
+            loss_object_mask = np.ones((object_points.shape[1],), dtype=bool)
+            if object_points.shape[1] > 1:
+                loss_object_mask[1:] = False
+        object_point_lens = np.full((object_points.shape[1],), point_count, dtype=np.int64)
+        if "object_point_counts" in data:
+            counts = np.asarray(data["object_point_counts"][episode_index, :, : object_points.shape[1]], dtype=np.int64)
+            object_point_lens = np.minimum(object_point_lens, counts.min(axis=0).clip(min=0))
+        try:
+            config = json.loads(str(file.attrs.get("rigidformer_pointcloud_config", "{}")))
+        except json.JSONDecodeError:
+            config = {}
+        gripper_part_ids = rollout_dataset.infer_gripper_part_ids_from_pointcloud_config(
+            config,
+            selected_points=point_count,
+            stored_points=int(points_ds.shape[-2]),
+        )
+        control_dt = float(config.get("control_dt", 0.02))
+    return EpisodePointCloudData(
+        name=episode_name,
+        object_points=object_points,
+        vertex_properties=vertex_properties[: object_points.shape[1]].astype(np.float32),
+        object_point_lens=object_point_lens,
+        loss_object_mask=loss_object_mask[: object_points.shape[1]],
+        gripper_part_ids=gripper_part_ids,
+        control_dt=control_dt,
+    )
 
 
 def load_episode_data(
@@ -200,6 +298,7 @@ def load_episode_data(
         object_pos=object_pos[:T].astype(np.float32),
         object_quat=object_quat[:T].astype(np.float32),
         state_layout=state_layout,
+        source_origin=origin.astype(np.float32),
         dt=dt,
     )
 
@@ -220,6 +319,16 @@ def rollout_episode(
     rollout_steps = min(rollout_steps, episode.T - start_t - 1)
     if rollout_steps <= 0:
         raise ValueError(f"No rollout room: start_t={start_t}, T={episode.T}.")
+
+    if isinstance(model, HybridRigidFormerWMDynamics) or getattr(model, "model_type", None) == "hybrid":
+        return _rollout_hybrid_episode(
+            model,
+            episode,
+            start_t=start_t,
+            rollout_steps=rollout_steps,
+            history_len=history_len,
+            device=device,
+        )
 
     if isinstance(model, RWMEnsemble) or getattr(model, "model_type", None) == "rwm":
         return _rollout_rwm_episode(
@@ -247,6 +356,120 @@ def rollout_episode(
                 history_torques=history_torques if getattr(model, "use_context_encoder", False) else None,
                 return_aux=False,
             )
+        except RuntimeError as exc:
+            pred = history_states.new_empty((1, 0, episode.state.shape[-1]))
+            failed_step = 0
+            failure_reason = f"model rollout failed: {exc}"
+
+    pred_np = pred.detach().cpu().numpy()[0].astype(np.float32)
+    if pred_np.size > 0:
+        finite_by_step = np.isfinite(pred_np).reshape(pred_np.shape[0], -1).all(axis=1)
+        if not bool(finite_by_step.all()):
+            first_bad = int(np.flatnonzero(~finite_by_step)[0])
+            pred_np = pred_np[:first_bad]
+            failed_step = first_bad
+            failure_reason = "non-finite predicted state"
+
+    gt_states = episode.state[start_t + 1 : start_t + 1 + pred_np.shape[0]]
+    return EpisodeRollout(
+        pred_states=pred_np,
+        gt_states=gt_states.astype(np.float32),
+        start_t=start_t,
+        failed_step=failed_step,
+        failure_reason=failure_reason,
+    )
+
+
+def _pointcloud_batch_for_rollout(
+    pc_episode: EpisodePointCloudData,
+    episode: EpisodeData,
+    *,
+    start_t: int,
+    rollout_steps: int,
+) -> dict[str, torch.Tensor]:
+    if start_t < 1:
+        raise ValueError("Hybrid RigidFormer rollout requires start_t >= 1 for history-2 pointcloud input.")
+    start = int(start_t) - 1
+    stop = int(start_t) + int(rollout_steps) + 1
+    if stop > pc_episode.T:
+        raise ValueError(f"Pointcloud rollout window [{start}, {stop}) exceeds T={pc_episode.T}.")
+    sequence = pc_episode.object_points[start:stop]
+    first_object_pos_w = episode.object_pos[0] + episode.source_origin
+    first_robot_q_obs = episode.state[0, episode.state_layout.robot_q_slice]
+    return {
+        "pc_delta_times": torch.tensor([pc_episode.control_dt], dtype=torch.float32),
+        "pc_vertex_properties": torch.from_numpy(pc_episode.vertex_properties[None]),
+        "pc_object_pos_prev": torch.from_numpy(sequence[None, 0]),
+        "pc_object_pos": torch.from_numpy(sequence[None, 1]),
+        "pc_object_pos_next": torch.from_numpy(sequence[None, 2]),
+        "pc_object_pos_rollout": torch.from_numpy(sequence[None]),
+        "pc_object_first_frame_pos": torch.from_numpy(pc_episode.object_points[None, 0]),
+        "pc_object_point_lens": torch.from_numpy(pc_episode.object_point_lens[None]),
+        "pc_object_lens": torch.tensor([pc_episode.object_points.shape[1]], dtype=torch.long),
+        "pc_loss_object_mask": torch.from_numpy(pc_episode.loss_object_mask[None]),
+        "pc_gripper_part_ids": torch.from_numpy(pc_episode.gripper_part_ids[None]),
+        "pc_first_object_pos_w": torch.from_numpy(first_object_pos_w[None].astype(np.float32)),
+        "pc_first_object_quat": torch.from_numpy(episode.object_quat[None, 0].astype(np.float32)),
+        "pc_env_origin": torch.from_numpy(episode.source_origin[None].astype(np.float32)),
+        "pc_first_robot_q_abs": torch.from_numpy(episode.joint_pos_abs[None, 0].astype(np.float32)),
+        "pc_first_robot_q_obs": torch.from_numpy(first_robot_q_obs[None].astype(np.float32)),
+    }
+
+
+def _rollout_hybrid_episode(
+    model: torch.nn.Module,
+    episode: EpisodeData,
+    *,
+    start_t: int,
+    rollout_steps: int,
+    history_len: int,
+    device: torch.device,
+) -> EpisodeRollout:
+    pointcloud_file = getattr(model, "pointcloud_file", None)
+    if not pointcloud_file:
+        raise ValueError("Hybrid episode rollout requires model.pointcloud_file.")
+    pc_episode = load_episode_pointcloud_data(
+        pointcloud_file,
+        episode.name,
+        max_points=int(getattr(model, "rigidformer_max_points", 1024)),
+    )
+    if start_t < 1:
+        return _empty_rollout(
+            episode,
+            start_t=start_t,
+            reason="hybrid pointcloud rollout requires start_t >= 1 for history-2 input",
+        )
+    rollout_steps = min(rollout_steps, pc_episode.T - start_t - 1)
+    if rollout_steps <= 0:
+        return _empty_rollout(
+            episode,
+            start_t=start_t,
+            reason=f"no hybrid pointcloud rollout room: start_t={start_t}, pointcloud_T={pc_episode.T}",
+        )
+
+    history_states = torch.from_numpy(episode.state[start_t - history_len + 1 : start_t + 1][None]).to(device)
+    history_torques = torch.from_numpy(episode.torque[start_t - history_len + 1 : start_t + 1][None]).to(device)
+    future_torques = torch.from_numpy(episode.torque[start_t : start_t + rollout_steps][None]).to(device)
+    pointcloud_batch = _pointcloud_batch_for_rollout(
+        pc_episode,
+        episode,
+        start_t=start_t,
+        rollout_steps=rollout_steps,
+    )
+    kwargs: dict[str, Any] = {
+        "history_torques": history_torques,
+        "pointcloud_batch": pointcloud_batch,
+        "feedback_mode": getattr(model, "feedback_mode", "robot_native"),
+    }
+    if str(getattr(model, "action_type", "torque")).strip().lower() == "policy":
+        kwargs["history_actions"] = torch.from_numpy(episode.action[start_t - history_len + 1 : start_t][None]).to(device)
+        kwargs["future_actions"] = torch.from_numpy(episode.action[start_t : start_t + rollout_steps][None]).to(device)
+
+    failed_step = None
+    failure_reason = None
+    with torch.inference_mode():
+        try:
+            pred = model(history_states, future_torques, **kwargs)
         except RuntimeError as exc:
             pred = history_states.new_empty((1, 0, episode.state.shape[-1]))
             failed_step = 0

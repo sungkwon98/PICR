@@ -1,0 +1,18 @@
+# RigidFormer object-dynamics config used by model_type: hybrid.
+
+max_points: 1024
+dim: 256
+dim_head: 64
+heads: 4
+num_anchors: 4
+object_self_attn_depth: 2
+anchor_cross_attn_depth: 2
+object_hidden_layers:
+anchor_self_attn: true
+use_platonic_transformer: false
+paper_architecture: false
+vertex_feature_dim: 256
+avp_dim: 128
+paper_pointnet_level_dim: 256
+pos_loss_weight: 10.0
+acc_loss_weight: 1.0

@@ -36,6 +36,17 @@ def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=str(_DEFAULT_CONFIG))
     parser.add_argument("--dataset_file", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--pointcloud_file", type=str, default=None)
+    parser.add_argument(
+        "--hybrid_rollout_feedback_mode",
+        choices=("robot_native", "rigidformer_pose"),
+        default=None,
+    )
+    parser.add_argument(
+        "--hybrid_gripper_pointcloud_mode",
+        choices=("gt", "predicted_fk"),
+        default=None,
+    )
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--episode_index", type=int, default=None)
@@ -190,6 +201,18 @@ def main() -> str:
     config = load_config(args_cli)
     loaded = load_checkpoint_model(config["checkpoint"], device=args_cli.device)
     wm_cfg = loaded.config
+    if config.get("pointcloud_file"):
+        wm_cfg.pointcloud_file = config["pointcloud_file"]
+        if hasattr(loaded.model, "pointcloud_file"):
+            loaded.model.pointcloud_file = config["pointcloud_file"]
+    if config.get("hybrid_rollout_feedback_mode"):
+        wm_cfg.hybrid_rollout_feedback_mode = config["hybrid_rollout_feedback_mode"]
+        if hasattr(loaded.model, "feedback_mode"):
+            loaded.model.feedback_mode = config["hybrid_rollout_feedback_mode"]
+    if config.get("hybrid_gripper_pointcloud_mode"):
+        wm_cfg.hybrid_gripper_pointcloud_mode = config["hybrid_gripper_pointcloud_mode"]
+        if hasattr(loaded.model, "gripper_pointcloud_mode"):
+            loaded.model.gripper_pointcloud_mode = config["hybrid_gripper_pointcloud_mode"]
 
     visual_episode = load_visual_episode(
         config["dataset_file"],
@@ -264,6 +287,9 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         "task": "Isaac-Lift-Cube-Franka-IK-Abs-v0",
         "dataset_file": "../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5",
         "checkpoint": "../outputs_wm_dynamics/run_20260622_100149/best.pt",
+        "pointcloud_file": None,
+        "hybrid_rollout_feedback_mode": None,
+        "hybrid_gripper_pointcloud_mode": None,
         "output": "../eval_outputs/isaaclab_gt_vs_wm.mp4",
         "episode_index": 0,
         "episode_name": None,
@@ -298,6 +324,9 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         "start_t",
         "rollout_steps",
         "max_frames",
+        "pointcloud_file",
+        "hybrid_rollout_feedback_mode",
+        "hybrid_gripper_pointcloud_mode",
         "fps",
         "video_width",
         "video_height",
@@ -318,8 +347,9 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         config["use_ground_truth_gripper"] = True
 
     base_dir = config_path.parent
-    for key in ("dataset_file", "checkpoint", "output"):
-        config[key] = resolve_path(config[key], base_dir)
+    for key in ("dataset_file", "checkpoint", "output", "pointcloud_file"):
+        if config.get(key):
+            config[key] = resolve_path(config[key], base_dir)
     config["episode_name"] = config.get("episode_name") or None
     return config
 

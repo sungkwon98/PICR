@@ -397,7 +397,8 @@ def render_animation(
         zorder=1.5,
     )
 
-    nan_xyz = ([np.nan], [np.nan], [np.nan])
+    nan_coord = np.asarray([np.nan], dtype=np.float32)
+    nan_xyz = (nan_coord, nan_coord, nan_coord)
     pred_target_line = pred_object_line = None
     gt_target_line = gt_object_line = None
     if show_pred:
@@ -717,6 +718,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render WMDynamics dataset/prediction animation.")
     parser.add_argument("--dataset_file", type=str, default="./dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5")
     parser.add_argument("--checkpoint", type=str, default="./outputs_wm_dynamics/run_20260622_100149/best.pt")
+    parser.add_argument("--pointcloud_file", type=str, default=None)
+    parser.add_argument(
+        "--hybrid_rollout_feedback_mode",
+        choices=("robot_native", "rigidformer_pose"),
+        default=None,
+    )
+    parser.add_argument(
+        "--hybrid_gripper_pointcloud_mode",
+        choices=("gt", "predicted_fk"),
+        default=None,
+    )
     parser.add_argument("--output", type=str, default="./eval_outputs/wm_dynamics_episode.mp4")
     parser.add_argument("--episode_index", type=int, default=3)
     parser.add_argument("--episode_name", type=str, default=None)
@@ -747,11 +759,23 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.checkpoint:
         loaded = load_checkpoint_model(args.checkpoint, device=args.device)
+        if args.pointcloud_file is not None:
+            loaded.config.pointcloud_file = os.path.abspath(args.pointcloud_file)
+            if hasattr(loaded.model, "pointcloud_file"):
+                loaded.model.pointcloud_file = loaded.config.pointcloud_file
+        if args.hybrid_rollout_feedback_mode is not None:
+            loaded.config.hybrid_rollout_feedback_mode = args.hybrid_rollout_feedback_mode
+            if hasattr(loaded.model, "feedback_mode"):
+                loaded.model.feedback_mode = args.hybrid_rollout_feedback_mode
+        if args.hybrid_gripper_pointcloud_mode is not None:
+            loaded.config.hybrid_gripper_pointcloud_mode = args.hybrid_gripper_pointcloud_mode
+            if hasattr(loaded.model, "gripper_pointcloud_mode"):
+                loaded.model.gripper_pointcloud_mode = args.hybrid_gripper_pointcloud_mode
         written = render_checkpoint_animation(
             model=loaded.model,
             cfg=loaded.config,
             dataset_file=args.dataset_file,
-            output_path= f"./eval_outputs/rwm_{args.episode_index}.mp4",
+            output_path=args.output,
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             pred_horizon=args.pred_horizon,

@@ -29,7 +29,15 @@ from robot_object_wm.eval.plots import (
 )
 from robot_object_wm.models.utils import FrankaForwardKinematics
 from robot_object_wm.models.rwm import RWMEnsemble
-from robot_object_wm.training.train import MODEL_NAME, RWMConfig, TrainConfig, build_model, parse_args
+from robot_object_wm.models.hybrid import HybridRigidFormerWMDynamics, rigidformer_eval_metrics
+from robot_object_wm.training.train import (
+    MODEL_NAME,
+    RWMConfig,
+    RigidFormerConfig,
+    TrainConfig,
+    build_model,
+    parse_args,
+)
 
 EvalSplit = Literal["all", "train", "val"]
 
@@ -48,6 +56,7 @@ class LoadedWorldModel:
     model: torch.nn.Module
     config: TrainConfig
     rwm_config: RWMConfig | None
+    rigidformer_config: RigidFormerConfig | None
     architecture: str
     layout: dict[str, Any]
     data_meta: dict[str, Any]
@@ -101,7 +110,8 @@ def load_checkpoint_model(
     checkpoint = torch.load(resolved_path, map_location=torch_device, weights_only=False)
     cfg = config_from_checkpoint(checkpoint)
     rwm_cfg = rwm_config_from_checkpoint(checkpoint)
-    model = build_model(cfg, device=torch_device, rwm_cfg=rwm_cfg).to(torch_device)
+    rigidformer_cfg = rigidformer_config_from_checkpoint(checkpoint)
+    model = build_model(cfg, device=torch_device, rwm_cfg=rwm_cfg, rigidformer_cfg=rigidformer_cfg).to(torch_device)
     try:
         model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
     except RuntimeError as exc:
@@ -112,6 +122,7 @@ def load_checkpoint_model(
         model=model,
         config=cfg,
         rwm_config=rwm_cfg,
+        rigidformer_config=rigidformer_cfg,
         architecture=str(checkpoint.get("architecture", MODEL_NAME)),
         layout=dict(checkpoint.get("layout", {})),
         data_meta=dict(checkpoint.get("data_meta", {})),
@@ -146,9 +157,19 @@ def rwm_config_from_checkpoint(checkpoint: dict[str, Any]) -> RWMConfig | None:
     return RWMConfig(**values)
 
 
+def rigidformer_config_from_checkpoint(checkpoint: dict[str, Any]) -> RigidFormerConfig | None:
+    saved = checkpoint.get("rigidformer_config")
+    if not isinstance(saved, dict):
+        return None
+    valid_fields = {field.name for field in fields(RigidFormerConfig)}
+    values = asdict(RigidFormerConfig()) | {key: value for key, value in saved.items() if key in valid_fields}
+    return RigidFormerConfig(**values)
+
+
 def make_eval_loader(
     cfg: TrainConfig,
     *,
+    rigidformer_cfg: RigidFormerConfig | None = None,
     dataset_file: str | None = None,
     dataset_dir: str | None = None,
     split: EvalSplit = "val",
@@ -171,7 +192,7 @@ def make_eval_loader(
     if not refs:
         raise RuntimeError(f"No episodes selected for eval split '{split}'.")
 
-    layout, dataset = _build_eval_dataset(cfg, refs)
+    layout, dataset = _build_eval_dataset(cfg, refs, rigidformer_cfg=rigidformer_cfg)
     loader = DataLoader(
         dataset,
         batch_size=batch_size or cfg.batch_size,
@@ -205,6 +226,7 @@ def evaluate_checkpoint(
     loaded = load_checkpoint_model(checkpoint_path, device=device)
     loader, meta = make_eval_loader(
         loaded.config,
+        rigidformer_cfg=loaded.rigidformer_config,
         dataset_file=dataset_file,
         dataset_dir=dataset_dir,
         split=split,
@@ -266,7 +288,11 @@ def evaluate_loader(
             pred = pred[finite_mask]
             target = target[finite_mask]
             batch_samples = int(pred.shape[0])
-            _add_weighted(totals, _batch_metrics(pred, target, layout), batch_samples)
+            batch_metrics = _batch_metrics(pred, target, layout)
+            if isinstance(model, HybridRigidFormerWMDynamics) or getattr(model, "model_type", None) == "hybrid":
+                hybrid_metrics = rigidformer_eval_metrics(model, batch, batch["future_states"].to(torch_device), torch_device)
+                batch_metrics.update({key: float(value.detach().cpu().item()) for key, value in hybrid_metrics.items()})
+            _add_weighted(totals, batch_metrics, batch_samples)
             _add_horizon(horizon_totals, _horizon_metrics(pred, target, layout), batch_samples)
             n_samples += batch_samples
             n_batches += 1
@@ -293,6 +319,19 @@ def predict_batch(
     batch: dict[str, Any],
     device: torch.device,
 ) -> torch.Tensor:
+    if isinstance(model, HybridRigidFormerWMDynamics) or getattr(model, "model_type", None) == "hybrid":
+        history_states = batch["history_states"].to(device)
+        future_torques = batch["future_torques"].to(device)
+        history_torques = batch["history_torques"].to(device)
+        kwargs: dict[str, Any] = {
+            "pointcloud_batch": batch,
+            "history_torques": history_torques,
+        }
+        if str(getattr(model, "action_type", "torque")).strip().lower() == "policy":
+            kwargs["history_actions"] = batch["history_actions"].to(device)
+            kwargs["future_actions"] = batch["future_actions"].to(device)
+        return model(history_states, future_torques, **kwargs)
+
     if isinstance(model, RWMEnsemble) or getattr(model, "model_type", None) == "rwm":
         return predict_rwm_batch(model, batch, device)
 
@@ -360,7 +399,7 @@ def _resolve_hdf5_paths(*, dataset_file: str | None, dataset_dir: str) -> list[s
     return paths
 
 
-def _build_eval_dataset(cfg: TrainConfig, refs: list[Any]):
+def _build_eval_dataset(cfg: TrainConfig, refs: list[Any], rigidformer_cfg: RigidFormerConfig | None = None):
     layout = rollout_dataset.make_robot_object_state_layout(
         robot_dof=cfg.robot_dof,
         action_dim=cfg.action_dim,
@@ -371,23 +410,32 @@ def _build_eval_dataset(cfg: TrainConfig, refs: list[Any]):
             len(rollout_dataset.parse_privileged_collision_pairs(cfg.privileged_collision_pairs)),
         ),
     )
-    dataset = rollout_dataset.RobotObjectWMRolloutDataset(
-        episode_refs=refs,
-        history_len=cfg.history_len,
-        rollout_horizon=cfg.rollout_horizon,
-        dt=cfg.dt,
-        torque_key=cfg.torque_key,
-        filter_pre_contact=cfg.filter_pre_contact,
-        object_displacement_threshold=cfg.object_displacement_threshold,
-        object_velocity_threshold=cfg.object_velocity_threshold,
-        contact_consecutive_steps=cfg.contact_consecutive_steps,
-        contact_settle_steps=cfg.contact_settle_steps,
-        subtract_env_origin=cfg.subtract_env_origin,
-        layout=layout,
-        privileged_collision_observation=cfg.privileged_collision_observation,
-        privileged_collision_group=cfg.privileged_collision_group,
-        privileged_collision_pairs=cfg.privileged_collision_pairs,
-    )
+    dataset_kwargs = {
+        "episode_refs": refs,
+        "history_len": cfg.history_len,
+        "rollout_horizon": cfg.rollout_horizon,
+        "dt": cfg.dt,
+        "torque_key": cfg.torque_key,
+        "filter_pre_contact": cfg.filter_pre_contact,
+        "object_displacement_threshold": cfg.object_displacement_threshold,
+        "object_velocity_threshold": cfg.object_velocity_threshold,
+        "contact_consecutive_steps": cfg.contact_consecutive_steps,
+        "contact_settle_steps": cfg.contact_settle_steps,
+        "subtract_env_origin": cfg.subtract_env_origin,
+        "layout": layout,
+        "privileged_collision_observation": cfg.privileged_collision_observation,
+        "privileged_collision_group": cfg.privileged_collision_group,
+        "privileged_collision_pairs": cfg.privileged_collision_pairs,
+    }
+    if str(cfg.model_type).strip().lower() == "hybrid":
+        rigidformer_cfg = rigidformer_cfg or RigidFormerConfig()
+        dataset_kwargs.update(
+            {
+                "pointcloud_file": cfg.pointcloud_file,
+                "pointcloud_max_points": rigidformer_cfg.max_points,
+            }
+        )
+    dataset = rollout_dataset.RobotObjectWMRolloutDataset(**dataset_kwargs)
     return layout, dataset
 
 
@@ -519,6 +567,17 @@ def parse_eval_args(argv: list[str] | None = None):
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./eval_outputs/wm_dynamics")
+    parser.add_argument("--pointcloud_file", type=str, default=None)
+    parser.add_argument(
+        "--hybrid_rollout_feedback_mode",
+        choices=("robot_native", "rigidformer_pose"),
+        default=None,
+    )
+    parser.add_argument(
+        "--hybrid_gripper_pointcloud_mode",
+        choices=("gt", "predicted_fk"),
+        default=None,
+    )
 
     episode = parser.add_argument_group("single episode rollout plot")
     episode.add_argument("--episode_plot", action="store_true", default=False)
@@ -549,8 +608,21 @@ def main(argv: list[str] | None = None) -> dict[str, str]:
     args = parse_eval_args(argv)
     os.makedirs(args.output_dir, exist_ok=True)
     loaded = load_checkpoint_model(args.checkpoint, device=args.device)
+    if args.pointcloud_file is not None:
+        loaded.config.pointcloud_file = os.path.abspath(args.pointcloud_file)
+        if hasattr(loaded.model, "pointcloud_file"):
+            loaded.model.pointcloud_file = loaded.config.pointcloud_file
+    if args.hybrid_rollout_feedback_mode is not None:
+        loaded.config.hybrid_rollout_feedback_mode = args.hybrid_rollout_feedback_mode
+        if hasattr(loaded.model, "feedback_mode"):
+            loaded.model.feedback_mode = args.hybrid_rollout_feedback_mode
+    if args.hybrid_gripper_pointcloud_mode is not None:
+        loaded.config.hybrid_gripper_pointcloud_mode = args.hybrid_gripper_pointcloud_mode
+        if hasattr(loaded.model, "gripper_pointcloud_mode"):
+            loaded.model.gripper_pointcloud_mode = args.hybrid_gripper_pointcloud_mode
     loader, meta = make_eval_loader(
         loaded.config,
+        rigidformer_cfg=loaded.rigidformer_config,
         dataset_file=args.dataset_file,
         dataset_dir=args.dataset_dir,
         split=args.split,

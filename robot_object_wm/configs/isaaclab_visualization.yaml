@@ -5,6 +5,9 @@
 task: Isaac-Lift-Cube-Franka-IK-Abs-v0
 dataset_file: ../dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
 checkpoint: ../outputs_wm_dynamics/run_20260622_100149/best.pt
+pointcloud_file:
+hybrid_rollout_feedback_mode:
+hybrid_gripper_pointcloud_mode:
 output: ../eval_outputs/isaaclab_gt_vs_wm.mp4
 
 # Episode selection from the dataset.

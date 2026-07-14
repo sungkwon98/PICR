@@ -4,10 +4,11 @@ import argparse
 import json
 import os
 import random
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, get_args, get_origin, get_type_hints
+from typing import Any, Mapping, get_args, get_origin, get_type_hints
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -24,8 +25,19 @@ from robot_object_wm.data import rollout_dataset
 from robot_object_wm.models.context import context_info_nce_loss, context_kl_loss
 from robot_object_wm.models.world_model import (
     WMDynamicsConfig,
+    build_robot_dynamics,
     build_wm_dynamics,
     weighted_rollout_mse,
+)
+from robot_object_wm.models.hybrid import (
+    HybridRigidFormerWMDynamics,
+    RigidFormerObjectConfig,
+    build_rigidformer_object_model,
+    normalize_hybrid_feedback_mode,
+    normalize_hybrid_gripper_pointcloud_mode,
+    normalize_hybrid_robot_model_type,
+    rigidformer_eval_metrics,
+    rigidformer_loss,
 )
 from robot_object_wm.models.rwm import RWMEnsemble
 from robot_object_wm.models.whole_dynamics import (
@@ -41,11 +53,15 @@ MODEL_NAME = "WMDynamics"
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PACKAGE_ROOT / "configs" / "train_config.yaml"
 DEFAULT_RWM_CONFIG_PATH = PACKAGE_ROOT / "configs" / "rwm_config.yaml"
+DEFAULT_RIGIDFORMER_CONFIG_PATH = PACKAGE_ROOT / "configs" / "hybrid_rigidformer_config.yaml"
 NONE_STRINGS = {"", "none", "null", "nil"}
 TRUE_STRINGS = {"1", "true", "t", "yes", "y", "on"}
 FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
 FIELD_CHOICES = {
-    "model_type": ("split", "whole", "MLP", "mlp", "rwm"),
+    "model_type": ("split", "whole", "MLP", "mlp", "rwm", "hybrid"),
+    "hybrid_robot_model_type": ("rwm", "delan"),
+    "hybrid_rollout_feedback_mode": ("robot_native", "rigidformer_pose"),
+    "hybrid_gripper_pointcloud_mode": ("gt", "predicted_fk"),
     "action_type": ("policy", "torque", "Torque"),
     "state_prediction_mode": ("full", "position"),
     "torque_key": ("applied_torque", "computed_torque"),
@@ -66,6 +82,13 @@ class TrainConfig:
     dataset_file: str | None
     model_type: str
     rwm_config: str | None
+    pointcloud_file: str | None
+    rigidformer_config: str | None
+    hybrid_robot_model_type: str
+    hybrid_rollout_feedback_mode: str
+    hybrid_gripper_pointcloud_mode: str
+    robot_loss_weight: float
+    rigidformer_loss_weight: float
     history_len: int
     rollout_horizon: int
     robot_dof: int
@@ -129,6 +152,7 @@ class TrainConfig:
     subtract_env_origin: bool
     eval_after_train: bool
     eval_fail_on_error: bool
+    render_every: int
     eval_output_dir: str
     eval_split: str
     eval_batch_size: int | None
@@ -145,6 +169,9 @@ class TrainConfig:
     eval_pred_horizon: int
     eval_prediction_max_episodes: int
     eval_video: bool
+    eval_isaaclab_video: bool
+    eval_isaaclab_config: str | None
+    eval_isaaclab_output: str | None
     eval_fps: int
     eval_max_frames: int
     eval_collision_info: bool
@@ -171,6 +198,46 @@ class RWMConfig:
     bootstrap: bool = False
 
 
+@dataclass
+class RigidFormerConfig:
+    max_points: int = 1024
+    dim: int = 256
+    dim_head: int = 64
+    heads: int = 4
+    num_anchors: int = 4
+    object_self_attn_depth: int = 2
+    anchor_cross_attn_depth: int = 2
+    object_hidden_layers: list[int] | None = None
+    anchor_self_attn: bool = False
+    use_platonic_transformer: bool = True
+    paper_architecture: bool = True
+    vertex_feature_dim: int = 256
+    avp_dim: int = 128
+    paper_pointnet_level_dim: int = 256
+    pos_loss_weight: float = 10.0
+    acc_loss_weight: float = 1.0
+
+    def to_model_config(self) -> RigidFormerObjectConfig:
+        return RigidFormerObjectConfig(
+            max_points=self.max_points,
+            dim=self.dim,
+            dim_head=self.dim_head,
+            heads=self.heads,
+            num_anchors=self.num_anchors,
+            object_self_attn_depth=self.object_self_attn_depth,
+            anchor_cross_attn_depth=self.anchor_cross_attn_depth,
+            object_hidden_layers=None if self.object_hidden_layers is None else tuple(self.object_hidden_layers),
+            anchor_self_attn=self.anchor_self_attn,
+            use_platonic_transformer=self.use_platonic_transformer,
+            paper_architecture=self.paper_architecture,
+            vertex_feature_dim=self.vertex_feature_dim,
+            avp_dim=self.avp_dim,
+            paper_pointnet_level_dim=self.paper_pointnet_level_dim,
+            pos_loss_weight=self.pos_loss_weight,
+            acc_loss_weight=self.acc_loss_weight,
+        )
+
+
 def _load_config_file(path: str) -> dict[str, Any]:
     if yaml is None:
         raise ImportError("PyYAML is required for TrainConfig YAML. Install it with `pip install pyyaml`.")
@@ -188,7 +255,16 @@ def _load_config_file(path: str) -> dict[str, Any]:
     if unknown:
         joined = ", ".join(unknown)
         raise ValueError(f"Unknown train config key(s) in {config_path}: {joined}")
-    for key in ("dataset_dir", "dataset_file", "output_dir", "rwm_config", "eval_collision_dataset_file"):
+    for key in (
+        "dataset_dir",
+        "dataset_file",
+        "output_dir",
+        "rwm_config",
+        "pointcloud_file",
+        "rigidformer_config",
+        "eval_isaaclab_config",
+        "eval_collision_dataset_file",
+    ):
         value = values.get(key)
         if isinstance(value, str) and value and not os.path.isabs(value):
             values[key] = str((config_path.parent / value).resolve())
@@ -219,6 +295,30 @@ def load_rwm_config(path: str | None) -> RWMConfig:
     return cfg
 
 
+def load_rigidformer_config(path: str | None) -> RigidFormerConfig:
+    if yaml is None:
+        raise ImportError("PyYAML is required for RigidFormerConfig YAML. Install it with `pip install pyyaml`.")
+
+    config_path = Path(path).expanduser() if path else DEFAULT_RIGIDFORMER_CONFIG_PATH
+    if not config_path.is_file():
+        raise FileNotFoundError(f"RigidFormer config YAML not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Expected a YAML mapping in {config_path}, got {type(loaded).__name__}.")
+
+    valid_keys = {field.name for field in fields(RigidFormerConfig)}
+    unknown = sorted(set(loaded) - valid_keys)
+    if unknown:
+        joined = ", ".join(unknown)
+        raise ValueError(f"Unknown RigidFormer config key(s) in {config_path}: {joined}")
+
+    values = asdict(RigidFormerConfig()) | loaded
+    cfg = RigidFormerConfig(**values)
+    _validate_rigidformer_config(cfg, config_path)
+    return cfg
+
+
 def _validate_rwm_config(cfg: RWMConfig, path: Path) -> None:
     if cfg.architecture.strip().lower() != "rnn":
         raise ValueError(f"{path}: only architecture: RNN is currently wired for training.")
@@ -232,6 +332,19 @@ def _validate_rwm_config(cfg: RWMConfig, path: Path) -> None:
         raise ValueError(f"{path}: state_mean_head must contain at least one hidden size.")
     if cfg.state_logstd_head is not None and not cfg.state_logstd_head:
         raise ValueError(f"{path}: state_logstd_head must be null or contain at least one hidden size.")
+
+
+def _validate_rigidformer_config(cfg: RigidFormerConfig, path: Path) -> None:
+    if cfg.max_points < 4:
+        raise ValueError(f"{path}: max_points must be >= 4.")
+    if cfg.dim < 1 or cfg.dim_head < 1 or cfg.heads < 1:
+        raise ValueError(f"{path}: dim, dim_head, and heads must be positive.")
+    if cfg.object_self_attn_depth < 1 or cfg.anchor_cross_attn_depth < 1:
+        raise ValueError(f"{path}: object_self_attn_depth and anchor_cross_attn_depth must be positive.")
+    if cfg.object_hidden_layers is not None and len(cfg.object_hidden_layers) != cfg.anchor_cross_attn_depth:
+        raise ValueError(f"{path}: object_hidden_layers length must match anchor_cross_attn_depth.")
+    if cfg.pos_loss_weight < 0.0 or cfg.acc_loss_weight < 0.0:
+        raise ValueError(f"{path}: RigidFormer loss weights must be non-negative.")
 
 
 def _require_config_keys(values: dict[str, Any], path: str | Path) -> None:
@@ -380,7 +493,7 @@ def _normalize_action_type(action_type: str) -> str:
 
 def _normalize_model_type(model_type: str) -> str:
     normalized = model_type.strip().lower()
-    if normalized not in {"split", "whole", "mlp", "rwm"}:
+    if normalized not in {"split", "whole", "mlp", "rwm", "hybrid"}:
         raise ValueError(f"Unknown model_type: {model_type}")
     return normalized
 
@@ -390,7 +503,12 @@ def _normalize_state_prediction_mode(state_prediction_mode: str) -> str:
 
 
 def _model_name(cfg: TrainConfig) -> str:
-    return "RWMEnsemble" if _normalize_model_type(cfg.model_type) == "rwm" else MODEL_NAME
+    model_type = _normalize_model_type(cfg.model_type)
+    if model_type == "rwm":
+        return "RWMEnsemble"
+    if model_type == "hybrid":
+        return "HybridRigidFormerWMDynamics"
+    return MODEL_NAME
 
 
 def _privileged_collision_pairs(cfg: TrainConfig) -> tuple[str, ...]:
@@ -418,11 +536,19 @@ def _validate_privileged_collision_model_support(cfg: TrainConfig) -> None:
     _state_layout(cfg)
     model_type = _normalize_model_type(cfg.model_type)
     state_prediction_mode = _normalize_state_prediction_mode(cfg.state_prediction_mode)
-    if state_prediction_mode != "full" and model_type != "rwm":
+    if state_prediction_mode != "full" and model_type not in {"rwm", "hybrid"}:
         raise ValueError(
-            "state_prediction_mode='position' is currently supported for model_type='rwm' only. "
+            "state_prediction_mode='position' is currently supported for model_type='rwm' and hybrid only. "
             "The split/whole/MLP dynamics paths still require velocity components in the state."
         )
+    if model_type == "hybrid":
+        robot_type = normalize_hybrid_robot_model_type(cfg.hybrid_robot_model_type)
+        normalize_hybrid_feedback_mode(cfg.hybrid_rollout_feedback_mode)
+        normalize_hybrid_gripper_pointcloud_mode(cfg.hybrid_gripper_pointcloud_mode)
+        if robot_type == "delan" and state_prediction_mode != "full":
+            raise ValueError("hybrid_robot_model_type='delan' requires state_prediction_mode='full'.")
+        if cfg.pointcloud_file in (None, ""):
+            raise ValueError("model_type='hybrid' requires pointcloud_file.")
 
 
 def _apply_rwm_horizons(cfg: TrainConfig, rwm_cfg: RWMConfig | None) -> None:
@@ -458,7 +584,7 @@ def _subsample_refs(refs: list[Any], fraction: float, seed: int, kind: str) -> l
     return random.Random(seed).sample(refs, n)
 
 
-def make_dataloaders(cfg: TrainConfig):
+def make_dataloaders(cfg: TrainConfig, rigidformer_cfg: RigidFormerConfig | None = None):
     _validate_privileged_collision_model_support(cfg)
     hdf5_paths = resolve_hdf5_paths(cfg)
     episode_refs = rollout_dataset.load_all_episode_refs(hdf5_paths)
@@ -484,6 +610,14 @@ def make_dataloaders(cfg: TrainConfig):
         "privileged_collision_group": cfg.privileged_collision_group,
         "privileged_collision_pairs": cfg.privileged_collision_pairs,
     }
+    if _normalize_model_type(cfg.model_type) == "hybrid":
+        rigidformer_cfg = rigidformer_cfg or load_rigidformer_config(cfg.rigidformer_config)
+        dataset_kwargs.update(
+            {
+                "pointcloud_file": cfg.pointcloud_file,
+                "pointcloud_max_points": rigidformer_cfg.max_points,
+            }
+        )
     train_dataset = rollout_dataset.RobotObjectWMRolloutDataset(
         episode_refs=train_refs,
         **dataset_kwargs,
@@ -519,9 +653,20 @@ def make_dataloaders(cfg: TrainConfig):
         "val_skipped_missing_torque_episodes": val_dataset.skipped_missing_torque_episodes,
         "train_skipped_missing_object_dynamics_episodes": train_dataset.skipped_missing_object_dynamics_episodes,
         "val_skipped_missing_object_dynamics_episodes": val_dataset.skipped_missing_object_dynamics_episodes,
+        "train_skipped_missing_pointcloud_episodes": getattr(train_dataset, "skipped_missing_pointcloud_episodes", 0),
+        "val_skipped_missing_pointcloud_episodes": getattr(val_dataset, "skipped_missing_pointcloud_episodes", 0),
+        "train_skipped_short_pointcloud_episodes": getattr(train_dataset, "skipped_short_pointcloud_episodes", 0),
+        "val_skipped_short_pointcloud_episodes": getattr(val_dataset, "skipped_short_pointcloud_episodes", 0),
         "train_skipped_contact_filtered_windows": train_dataset.skipped_contact_filtered_windows,
         "val_skipped_contact_filtered_windows": val_dataset.skipped_contact_filtered_windows,
     }
+    if _normalize_model_type(cfg.model_type) == "hybrid":
+        meta.update(
+            {
+                "pointcloud_file": os.path.abspath(str(cfg.pointcloud_file)),
+                "pointcloud_max_points": int((rigidformer_cfg or load_rigidformer_config(cfg.rigidformer_config)).max_points),
+            }
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -568,6 +713,7 @@ def build_model(
     *,
     device: torch.device | str | None = None,
     rwm_cfg: RWMConfig | None = None,
+    rigidformer_cfg: RigidFormerConfig | None = None,
 ) -> torch.nn.Module:
     model_type = _normalize_model_type(cfg.model_type)
     layout = _state_layout(cfg)
@@ -586,6 +732,57 @@ def build_model(
         model.model_type = "rwm"
         model.action_type = _normalize_action_type(cfg.action_type)
         return model
+    if model_type == "hybrid":
+        rigidformer_cfg = rigidformer_cfg or load_rigidformer_config(cfg.rigidformer_config)
+        robot_type = normalize_hybrid_robot_model_type(cfg.hybrid_robot_model_type)
+        torch_device = torch.device(device or "cpu")
+        if robot_type == "rwm":
+            rwm_cfg = rwm_cfg or load_rwm_config(cfg.rwm_config)
+            robot = RWMEnsemble(
+                state_dim=layout.state_dim,
+                action_dim=_rwm_action_dim(cfg),
+                device=str(torch_device),
+                ensemble_size=rwm_cfg.ensemble_size,
+                history_horizon=rwm_cfg.history_horizon,
+                architecture_config=_rwm_architecture_config(rwm_cfg),
+            )
+            robot.model_type = "rwm"
+            robot.action_type = _normalize_action_type(cfg.action_type)
+        else:
+            model_cfg = WMDynamicsConfig(
+                robot_dof=cfg.robot_dof,
+                torque_dim=cfg.torque_dim,
+                hidden_dim=cfg.hidden_dim,
+                object_hidden_dim=cfg.object_hidden_dim,
+                object_depth=cfg.object_depth,
+                dt=cfg.dt,
+                ode_solver=cfg.ode_solver,
+                tool_z_offset=cfg.tool_z_offset,
+                history_len=cfg.history_len,
+                use_context_encoder=False,
+                latent_dim=cfg.latent_dim,
+                context_encoder_hidden_dim=cfg.context_encoder_hidden_dim,
+                context_encoder_depth=cfg.context_encoder_depth,
+                delan_use_film=False,
+                delan_film_depth=cfg.delan_film_depth,
+                delan_use_history=cfg.delan_use_history,
+                privileged_collision_obs_dim=layout.privileged_collision_obs_dim,
+            )
+            robot = build_robot_dynamics(model_cfg)
+        rigidformer = build_rigidformer_object_model(rigidformer_cfg.to_model_config())
+        return HybridRigidFormerWMDynamics(
+            robot=robot,
+            rigidformer=rigidformer,
+            layout=layout,
+            robot_backend=robot_type,
+            dt=cfg.dt,
+            action_type=_normalize_action_type(cfg.action_type),
+            feedback_mode=cfg.hybrid_rollout_feedback_mode,
+            gripper_pointcloud_mode=cfg.hybrid_gripper_pointcloud_mode,
+            subtract_env_origin=cfg.subtract_env_origin,
+            pointcloud_file=cfg.pointcloud_file,
+            rigidformer_max_points=rigidformer_cfg.max_points,
+        )
     if model_type in {"whole", "mlp"}:
         whole_cfg = WholeWMDynamicsConfig(
             robot_dof=cfg.robot_dof,
@@ -802,6 +999,152 @@ def run_rwm_epoch(
     return averager.means()
 
 
+def _hybrid_robot_state_loss_mask(cfg: TrainConfig, device: torch.device) -> torch.Tensor:
+    layout = _state_layout(cfg)
+    mask = torch.zeros(layout.state_dim, dtype=torch.float32, device=device)
+    mask[layout.robot_q_slice] = 1.0
+    if layout.has_joint_vel:
+        mask[layout.robot_dq_slice] = 1.0
+    return mask
+
+
+def _hybrid_rwm_robot_loss(
+    model: HybridRigidFormerWMDynamics,
+    batch: dict[str, Any],
+    device: torch.device,
+    cfg: TrainConfig,
+    rwm_cfg: RWMConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    state_batch, action_batch, action_values = _rwm_sequence_batch(batch, device, cfg)
+    state_loss, sequence_loss, bound_loss, kl_loss = model.robot.compute_loss(
+        state_batch,
+        action_batch,
+        bootstrap=rwm_cfg.bootstrap,
+        state_loss_mask=_hybrid_robot_state_loss_mask(cfg, device),
+    )
+    loss = (
+        rwm_cfg.state_loss_weight * state_loss
+        + rwm_cfg.sequence_loss_weight * sequence_loss
+        + rwm_cfg.bound_loss_weight * bound_loss
+        + rwm_cfg.kl_loss_weight * kl_loss
+    )
+    return loss, {
+        "hybrid_robot_loss": loss.detach(),
+        "hybrid_rwm_state_loss": state_loss.detach(),
+        "hybrid_rwm_sequence_loss": sequence_loss.detach(),
+        "hybrid_rwm_bound_loss": bound_loss.detach(),
+        "hybrid_rwm_kl_loss": kl_loss.detach(),
+        "action_abs_mean": action_values.abs().mean().detach(),
+    }
+
+
+def _hybrid_delan_robot_loss(
+    model: HybridRigidFormerWMDynamics,
+    batch: dict[str, Any],
+    device: torch.device,
+    cfg: TrainConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    history_states = batch["history_states"].to(device)
+    future_torques = batch["future_torques"].to(device)
+    future_states = batch["future_states"].to(device)
+    pred_future = model(
+        history_states,
+        future_torques,
+        history_torques=batch["history_torques"].to(device),
+        pointcloud_batch=None,
+        feedback_mode="robot_native",
+    )
+    layout = _state_layout(cfg)
+    q_loss = torch.nn.functional.mse_loss(pred_future[..., layout.robot_q_slice], future_states[..., layout.robot_q_slice])
+    if layout.has_joint_vel:
+        dq_loss = torch.nn.functional.mse_loss(
+            pred_future[..., layout.robot_dq_slice],
+            future_states[..., layout.robot_dq_slice],
+        )
+    else:
+        dq_loss = q_loss.new_zeros(())
+    loss = cfg.q_weight * q_loss + cfg.dq_weight * dq_loss
+    return loss, {
+        "hybrid_robot_loss": loss.detach(),
+        "hybrid_delan_q_mse": q_loss.detach(),
+        "hybrid_delan_dq_mse": dq_loss.detach(),
+    }
+
+
+def run_hybrid_epoch(
+    model: HybridRigidFormerWMDynamics,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    device: torch.device,
+    cfg: TrainConfig,
+    rwm_cfg: RWMConfig | None,
+    max_batches: int | None,
+) -> dict[str, float]:
+    is_train = optimizer is not None
+    model.train(is_train)
+    averager = MetricAverager()
+    num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
+    phase = "train" if is_train else "val"
+
+    for batch_idx, batch in enumerate(loader, start=1):
+        if max_batches is not None and batch_idx > max_batches:
+            break
+
+        with torch.set_grad_enabled(is_train):
+            if model.robot_backend == "rwm":
+                if rwm_cfg is None:
+                    raise ValueError("rwm_cfg is required for hybrid_robot_model_type='rwm'.")
+                if hasattr(model.robot, "reset"):
+                    model.robot.reset()
+                robot_loss, robot_metrics = _hybrid_rwm_robot_loss(model, batch, device, cfg, rwm_cfg)
+            else:
+                robot_loss, robot_metrics = _hybrid_delan_robot_loss(model, batch, device, cfg)
+
+            rf_loss, rf_breakdown = rigidformer_loss(model, batch, device)
+            loss = cfg.robot_loss_weight * robot_loss + cfg.rigidformer_loss_weight * rf_loss
+            if not _is_finite(loss):
+                _raise_nonfinite_step(
+                    phase,
+                    batch_idx,
+                    {
+                        "robot_loss": robot_loss,
+                        "rigidformer_loss": rf_loss,
+                        "loss": loss,
+                        "pc_object_pos": batch["pc_object_pos"].to(device),
+                        "pc_object_pos_next": batch["pc_object_pos_next"].to(device),
+                    },
+                )
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            if not _is_finite(grad_norm):
+                _raise_nonfinite_step(phase, batch_idx, {"loss": loss, "grad_norm": grad_norm})
+            optimizer.step()
+
+        metrics = {
+            "loss": loss.detach(),
+            "robot_loss": robot_loss.detach(),
+            "rigidformer_loss": rf_loss.detach(),
+            "rigidformer_acceleration_loss": rf_breakdown.acceleration.detach(),
+            "rigidformer_position_loss": rf_breakdown.position.detach(),
+        }
+        metrics.update(robot_metrics)
+        if not is_train:
+            future_states = batch["future_states"].to(device)
+            metrics.update(rigidformer_eval_metrics(model, batch, future_states, device))
+        averager.update(metrics)
+        averager.step()
+
+        if cfg.log_every_batches > 0 and batch_idx % cfg.log_every_batches == 0:
+            print(f"  [{phase}] batch {batch_idx}/{num_batches} loss={loss.item():.6f}")
+
+    if model.robot_backend == "rwm" and hasattr(model.robot, "reset"):
+        model.robot.reset()
+    return averager.means()
+
+
 def run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -811,6 +1154,8 @@ def run_epoch(
     max_batches: int | None,
     rwm_cfg: RWMConfig | None = None,
 ) -> dict[str, float]:
+    if _normalize_model_type(cfg.model_type) == "hybrid":
+        return run_hybrid_epoch(model, loader, optimizer, device, cfg, rwm_cfg, max_batches)
     if _normalize_model_type(cfg.model_type) == "rwm":
         if rwm_cfg is None:
             raise ValueError("rwm_cfg is required when model_type='rwm'.")
@@ -949,6 +1294,30 @@ def _step_metrics(
     return metrics
 
 
+def _format_epoch_summary(
+    epoch: int,
+    train_metrics: Mapping[str, float],
+    val_metrics: Mapping[str, float],
+) -> str:
+    parts = [
+        f"[Epoch {epoch:03d}]",
+        f"train_loss={float(train_metrics['loss']):.6f}",
+        f"val_loss={float(val_metrics['loss']):.6f}",
+    ]
+    optional_keys = (
+        ("rollout_loss", "val_rollout"),
+        ("robot_loss", "val_robot"),
+        ("rigidformer_loss", "val_rigidformer"),
+        ("rigidformer_point_rmse", "val_rf_point_rmse"),
+        ("rigidformer_pose_position_rmse", "val_rf_pose_pos_rmse"),
+        ("rigidformer_pose_orientation_rmse_rad", "val_rf_pose_ori_rmse_rad"),
+    )
+    for key, label in optional_keys:
+        if key in val_metrics:
+            parts.append(f"{label}={float(val_metrics[key]):.6f}")
+    return " ".join(parts)
+
+
 def _print_run_header(
     cfg: TrainConfig,
     device: torch.device,
@@ -957,6 +1326,7 @@ def _print_run_header(
     *,
     model_name: str = MODEL_NAME,
     rwm_cfg: RWMConfig | None = None,
+    rigidformer_cfg: RigidFormerConfig | None = None,
 ) -> None:
     print("Training config:")
     for key, value in asdict(cfg).items():
@@ -964,6 +1334,10 @@ def _print_run_header(
     if rwm_cfg is not None:
         print("RWM config:")
         for key, value in asdict(rwm_cfg).items():
+            print(f"  {key}: {value}")
+    if rigidformer_cfg is not None:
+        print("RigidFormer config:")
+        for key, value in asdict(rigidformer_cfg).items():
             print(f"  {key}: {value}")
     print(f"Model: {model_name}")
     print(f"Device: {device}")
@@ -982,6 +1356,12 @@ def _post_training_eval_output_dir(cfg: TrainConfig, run_output_dir: str) -> str
     if os.path.isabs(cfg.eval_output_dir):
         return cfg.eval_output_dir
     return os.path.join(run_output_dir, cfg.eval_output_dir)
+
+
+def _resolve_eval_artifact_path(output_dir: str, value: str | None, default_name: str) -> str:
+    if value:
+        return value if os.path.isabs(value) else os.path.join(output_dir, value)
+    return os.path.join(output_dir, default_name)
 
 
 def _collision_augmented_path(path: str) -> str:
@@ -1064,14 +1444,10 @@ def _collect_eval_media(output_dir: str, written: dict[str, str] | None = None) 
     return media
 
 
-def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
-    if not cfg.eval_after_train:
-        return
-
-    output_dir = _post_training_eval_output_dir(cfg, run.output_dir)
+def _rollout_eval_argv(cfg: TrainConfig, checkpoint_path: str, output_dir: str) -> list[str]:
     argv = [
         "--checkpoint",
-        run.best_path,
+        checkpoint_path,
         "--output_dir",
         output_dir,
         "--split",
@@ -1099,6 +1475,11 @@ def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
         argv.extend(["--dataset_file", cfg.dataset_file])
     else:
         argv.extend(["--dataset_dir", cfg.dataset_dir])
+    if _normalize_model_type(cfg.model_type) == "hybrid":
+        if cfg.pointcloud_file:
+            argv.extend(["--pointcloud_file", cfg.pointcloud_file])
+        argv.extend(["--hybrid_rollout_feedback_mode", cfg.hybrid_rollout_feedback_mode])
+        argv.extend(["--hybrid_gripper_pointcloud_mode", cfg.hybrid_gripper_pointcloud_mode])
     _optional_arg(argv, "--batch_size", cfg.eval_batch_size)
     _optional_arg(argv, "--max_batches", cfg.eval_max_batches)
     _optional_arg(argv, "--max_episodes", cfg.eval_max_episodes)
@@ -1116,48 +1497,196 @@ def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
             collision_dataset_file = _eval_collision_dataset_file(cfg)
             if collision_dataset_file:
                 argv.extend(["--collision_dataset_file", collision_dataset_file])
+    return argv
+
+
+def _run_rollout_evaluation(
+    cfg: TrainConfig,
+    run,
+    *,
+    checkpoint_path: str,
+    output_dir: str,
+    step: int | None,
+    label: str,
+) -> tuple[dict[str, float], dict[str, str]]:
+    print(f"===== {label} rollout evaluation =====")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Eval output dir: {output_dir}")
+    from robot_object_wm.eval.rollout import main as eval_main
+
+    written = eval_main(_rollout_eval_argv(cfg, checkpoint_path, output_dir))
+    metrics = _read_eval_metrics(output_dir)
+    media = _collect_eval_media(output_dir, written)
+    if not media:
+        print(f"[WARN] No eval media files found under {output_dir}.")
+    run.log_evaluation(output_dir, metrics=metrics, media=media, step=step, fps=cfg.eval_fps)
+    return metrics, media
+
+
+def _isaaclab_eval_argv(cfg: TrainConfig, checkpoint_path: str, output_path: str) -> list[str]:
+    config_path = cfg.eval_isaaclab_config or str(PACKAGE_ROOT / "configs" / "isaaclab_visualization.yaml")
+    argv = [
+        str(PACKAGE_ROOT / "eval" / "isaaclab_visualization.py"),
+        "--config",
+        config_path,
+        "--checkpoint",
+        checkpoint_path,
+        "--output",
+        output_path,
+        "--episode_index",
+        str(cfg.eval_episode_index),
+        "--start_t",
+        str(cfg.eval_start_t),
+        "--rollout_steps",
+        str(cfg.eval_rollout_steps),
+        "--max_frames",
+        str(cfg.eval_max_frames),
+        "--fps",
+        str(cfg.eval_fps),
+    ]
+    if cfg.dataset_file:
+        argv.extend(["--dataset_file", cfg.dataset_file])
+    if _normalize_model_type(cfg.model_type) == "hybrid":
+        if cfg.pointcloud_file:
+            argv.extend(["--pointcloud_file", cfg.pointcloud_file])
+        argv.extend(["--hybrid_rollout_feedback_mode", cfg.hybrid_rollout_feedback_mode])
+        argv.extend(["--hybrid_gripper_pointcloud_mode", cfg.hybrid_gripper_pointcloud_mode])
+    _optional_arg(argv, "--episode_name", cfg.eval_episode_name)
+    return argv
+
+
+def _run_isaaclab_evaluation(
+    cfg: TrainConfig,
+    run,
+    *,
+    checkpoint_path: str,
+    output_dir: str,
+    step: int | None,
+    label: str,
+) -> dict[str, str]:
+    if not cfg.eval_isaaclab_video:
+        return {}
+    output_path = _resolve_eval_artifact_path(output_dir, cfg.eval_isaaclab_output, "isaaclab_comparison.mp4")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    argv = _isaaclab_eval_argv(cfg, checkpoint_path, output_path)
+    env = os.environ.copy()
+    repo_root = str(PACKAGE_ROOT.parent)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else repo_root
+    print(f"===== {label} IsaacLab visualization =====")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"IsaacLab video: {output_path}")
+    subprocess.run([sys.executable, *argv], cwd=str(PACKAGE_ROOT), env=env, check=True)
+    media = {"isaaclab_comparison": output_path} if os.path.isfile(output_path) else {}
+    if not media:
+        print(f"[WARN] IsaacLab visualization did not write expected video: {output_path}")
+    run.log_evaluation(output_dir, media=media, step=step, fps=cfg.eval_fps)
+    return media
+
+
+def run_training_evaluation(
+    cfg: TrainConfig,
+    run,
+    *,
+    checkpoint_path: str,
+    output_dir: str,
+    step: int | None,
+    label: str,
+) -> None:
+    for name, callback in (
+        ("rollout", _run_rollout_evaluation),
+        ("isaaclab", _run_isaaclab_evaluation),
+    ):
+        try:
+            callback(cfg, run, checkpoint_path=checkpoint_path, output_dir=output_dir, step=step, label=label)
+        except Exception as exc:
+            if cfg.eval_fail_on_error:
+                raise
+            print(f"[WARN] {label} {name} evaluation failed: {exc}")
+
+
+def run_post_training_evaluation(cfg: TrainConfig, run) -> None:
+    if not cfg.eval_after_train:
+        return
+
+    output_dir = _post_training_eval_output_dir(cfg, run.output_dir)
 
     print("===== Post-training evaluation =====")
     print(f"Best checkpoint: {run.best_path}")
     print(f"Eval output dir: {output_dir}")
-    try:
-        from robot_object_wm.eval.rollout import main as eval_main
+    run_training_evaluation(
+        cfg,
+        run,
+        checkpoint_path=run.best_path,
+        output_dir=output_dir,
+        step=None,
+        label="Post-training",
+    )
 
-        written = eval_main(argv)
-        metrics = _read_eval_metrics(output_dir)
-        media = _collect_eval_media(output_dir, written)
-        if not media:
-            print(f"[WARN] No eval media files found under {output_dir}.")
-        run.log_evaluation(output_dir, metrics=metrics, media=media, fps=cfg.eval_fps)
-    except Exception as exc:
-        if cfg.eval_fail_on_error:
-            raise
-        print(f"[WARN] Post-training evaluation failed: {exc}")
+
+def run_periodic_rendering(cfg: TrainConfig, run, *, epoch: int) -> None:
+    if cfg.render_every <= 0:
+        return
+    if epoch % cfg.render_every != 0:
+        return
+    if epoch == cfg.epochs and cfg.eval_after_train:
+        return
+    output_root = _post_training_eval_output_dir(cfg, run.output_dir)
+    output_dir = os.path.join(output_root, f"epoch_{epoch:04d}")
+    run_training_evaluation(
+        cfg,
+        run,
+        checkpoint_path=run.last_path,
+        output_dir=output_dir,
+        step=epoch,
+        label=f"Epoch {epoch:04d}",
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     cfg = parse_args(argv)
     cfg.action_type = _normalize_action_type(cfg.action_type)
+    if cfg.render_every < 0:
+        raise ValueError("render_every must be >= 0; use 0 to disable periodic rendering.")
+    if cfg.eval_isaaclab_video and not cfg.dataset_file:
+        raise ValueError("eval_isaaclab_video=True requires dataset_file; dataset_dir is not enough for rendering.")
     model_type = _normalize_model_type(cfg.model_type)
     if cfg.use_context_info_nce and not cfg.use_context_encoder:
         raise ValueError("use_context_info_nce=True requires use_context_encoder=True.")
     if cfg.use_context_info_nce and model_type == "rwm":
         raise ValueError("use_context_info_nce=True is only supported for split/whole/MLP context encoders.")
-    rwm_cfg = load_rwm_config(cfg.rwm_config) if model_type == "rwm" else None
+    if cfg.use_context_info_nce and model_type == "hybrid":
+        raise ValueError("use_context_info_nce=True is not supported for model_type='hybrid'.")
+    rwm_cfg = (
+        load_rwm_config(cfg.rwm_config)
+        if model_type == "rwm"
+        or (model_type == "hybrid" and normalize_hybrid_robot_model_type(cfg.hybrid_robot_model_type) == "rwm")
+        else None
+    )
+    rigidformer_cfg = load_rigidformer_config(cfg.rigidformer_config) if model_type == "hybrid" else None
     _apply_rwm_horizons(cfg, rwm_cfg)
     model_name = _model_name(cfg)
     run_config = asdict(cfg)
     if rwm_cfg is not None:
         run_config["rwm_config_values"] = asdict(rwm_cfg)
+    if rigidformer_cfg is not None:
+        run_config["rigidformer_config_values"] = asdict(rigidformer_cfg)
 
     set_seed(cfg.seed)
     run = start_training_run(cfg, model_name, run_config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, val_loader, layout, meta = make_dataloaders(cfg)
-    model = build_model(cfg, device=device, rwm_cfg=rwm_cfg).to(device)
+    train_loader, val_loader, layout, meta = make_dataloaders(cfg, rigidformer_cfg=rigidformer_cfg)
+    model = build_model(cfg, device=device, rwm_cfg=rwm_cfg, rigidformer_cfg=rigidformer_cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    _print_run_header(cfg, device, run.output_dir, meta, model_name=model_name, rwm_cfg=rwm_cfg)
+    _print_run_header(
+        cfg,
+        device,
+        run.output_dir,
+        meta,
+        model_name=model_name,
+        rwm_cfg=rwm_cfg,
+        rigidformer_cfg=rigidformer_cfg,
+    )
     run.update_config({"architecture": model_name, "data_meta": meta})
 
     best_val = float("inf")
@@ -1167,11 +1696,7 @@ def main(argv: list[str] | None = None) -> None:
         for epoch in range(1, cfg.epochs + 1):
             train_metrics = run_epoch(model, train_loader, optimizer, device, cfg, max_train_batches, rwm_cfg)
             val_metrics = run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg)
-            print(
-                f"[Epoch {epoch:03d}] "
-                f"train_loss={train_metrics['loss']:.6f} val_loss={val_metrics['loss']:.6f} "
-                f"val_rollout={val_metrics['rollout_loss']:.6f}"
-            )
+            print(_format_epoch_summary(epoch, train_metrics, val_metrics))
             best_val = checkpoint_and_log_epoch(
                 run=run,
                 epoch=epoch,
@@ -1182,6 +1707,7 @@ def main(argv: list[str] | None = None) -> None:
                     "architecture": model_name,
                     "config": asdict(cfg),
                     "rwm_config": asdict(rwm_cfg) if rwm_cfg is not None else None,
+                    "rigidformer_config": asdict(rigidformer_cfg) if rigidformer_cfg is not None else None,
                     "layout": layout.to_dict(),
                     "data_meta": meta,
                     "train_metrics": train_metrics,
@@ -1191,6 +1717,7 @@ def main(argv: list[str] | None = None) -> None:
                 val_metrics=val_metrics,
                 best_val_loss=best_val,
             )
+            run_periodic_rendering(cfg, run, epoch=epoch)
         print(f"Best checkpoint: {run.best_path}")
         print(f"Last checkpoint: {run.last_path}")
         print(f"W&B run: {run.wandb_url or cfg.wandb_mode}")

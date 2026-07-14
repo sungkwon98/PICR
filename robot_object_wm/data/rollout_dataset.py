@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
+from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -26,6 +28,80 @@ RobotObjectWMStateLayout = RobotObjectStateLayout
 
 def _decode_hdf5_strings(values) -> list[str]:
     return [value.decode("utf-8") if isinstance(value, bytes) else str(value) for value in values]
+
+
+def _allocate_counts(total: int, weights: np.ndarray) -> np.ndarray:
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = np.maximum(weights, 1.0e-9)
+    raw = weights / weights.sum() * int(total)
+    counts = np.floor(raw).astype(np.int64)
+    counts = np.maximum(counts, 1)
+    while int(counts.sum()) > int(total):
+        counts[int(np.argmax(counts))] -= 1
+    remainder = int(total - counts.sum())
+    if remainder > 0:
+        order = np.argsort(raw - np.floor(raw))[::-1]
+        for idx in order[:remainder]:
+            counts[int(idx)] += 1
+    return counts
+
+
+def _resolve_repo_mesh_path(path_value: str | None, name: str) -> Path | None:
+    candidates: list[Path] = []
+    if path_value:
+        raw = Path(path_value).expanduser()
+        candidates.append(raw)
+        parts = raw.parts
+        if "rigidformer" in parts:
+            idx = parts.index("rigidformer")
+            candidates.append(Path(__file__).resolve().parents[2].joinpath(*parts[idx:]))
+    candidates.append(Path(__file__).resolve().parents[2] / "rigidformer" / "data" / "franka_objects" / "gripper_meshes" / name)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _mesh_area(path: Path) -> float:
+    try:
+        import trimesh
+    except ImportError:
+        return 1.0
+    loaded = trimesh.load(path, process=False)
+    if isinstance(loaded, trimesh.Scene):
+        loaded = loaded.dump(concatenate=True)
+    return float(getattr(loaded, "area", 1.0))
+
+
+def infer_gripper_part_ids_from_pointcloud_config(
+    config: dict,
+    *,
+    selected_points: int,
+    stored_points: int,
+) -> np.ndarray:
+    """Infer hand/left/right point segments used by the mesh/FK point-cloud file."""
+    hand_mesh = _resolve_repo_mesh_path(config.get("hand_mesh"), "hand.obj")
+    finger_mesh = _resolve_repo_mesh_path(config.get("finger_mesh"), "finger.obj")
+    if hand_mesh is None:
+        hand_mesh = _resolve_repo_mesh_path(None, "hand.stl")
+    if finger_mesh is None:
+        finger_mesh = _resolve_repo_mesh_path(None, "finger.stl")
+    if hand_mesh is not None and finger_mesh is not None:
+        weights = np.asarray([_mesh_area(hand_mesh), _mesh_area(finger_mesh), _mesh_area(finger_mesh)], dtype=np.float64)
+    else:
+        weights = np.ones((3,), dtype=np.float64)
+    counts = _allocate_counts(int(stored_points), weights)
+    part_ids = np.concatenate(
+        (
+            np.zeros((counts[0],), dtype=np.int64),
+            np.ones((counts[1],), dtype=np.int64),
+            np.full((counts[2],), 2, dtype=np.int64),
+        )
+    )
+    if part_ids.shape[0] < int(stored_points):
+        pad = np.full((int(stored_points) - part_ids.shape[0],), 2, dtype=np.int64)
+        part_ids = np.concatenate([part_ids, pad])
+    return part_ids[: int(selected_points)].astype(np.int64, copy=False)
 
 
 def load_privileged_collision_observation(
@@ -106,6 +182,8 @@ class RobotObjectWMRolloutDataset(Dataset):
         privileged_collision_observation: int = 0,
         privileged_collision_group: str = "privileged_collision",
         privileged_collision_pairs: str | None = None,
+        pointcloud_file: str | None = None,
+        pointcloud_max_points: int | None = None,
     ) -> None:
         super().__init__()
         if history_len < 1:
@@ -115,15 +193,27 @@ class RobotObjectWMRolloutDataset(Dataset):
         self.privileged_collision_observation = int(privileged_collision_observation)
         self.privileged_collision_group = privileged_collision_group
         self.privileged_collision_pairs = parse_privileged_collision_pairs(privileged_collision_pairs)
-        expected_collision_dim = privileged_collision_observation_dim(
-            self.privileged_collision_observation,
-            len(self.privileged_collision_pairs),
-        )
         self.history_len = history_len
         self.rollout_horizon = rollout_horizon
         self.dt = dt
         self.torque_key = torque_key
         self.subtract_env_origin = subtract_env_origin
+        self.pointcloud_file = None if pointcloud_file in (None, "") else str(pointcloud_file)
+        self.pointcloud_max_points = int(pointcloud_max_points) if pointcloud_max_points is not None else None
+        self._pointcloud_h5 = None
+        self._pointcloud_episode_to_index: dict[str, int] = {}
+        self._pointcloud_steps = 0
+        self._pointcloud_num_objects = 0
+        self._pointcloud_stored_points = 0
+        self._pointcloud_points = 0
+        self._pointcloud_dt = float(dt)
+        self._pointcloud_gripper_part_ids = np.zeros((0,), dtype=np.int64)
+        if self.pointcloud_file is not None:
+            self._load_pointcloud_metadata()
+        expected_collision_dim = privileged_collision_observation_dim(
+            self.privileged_collision_observation,
+            len(self.privileged_collision_pairs),
+        )
         self.layout = layout or RobotObjectWMStateLayout(privileged_collision_obs_dim=expected_collision_dim)
         if self.layout.privileged_collision_obs_dim != expected_collision_dim:
             raise ValueError(
@@ -140,10 +230,18 @@ class RobotObjectWMRolloutDataset(Dataset):
         self.object_context: list[np.ndarray] = []
         self.contact_t_in_window: list[int] = []
         self.sample_meta: list[tuple[str, str, int, int]] = []
+        self.pointcloud_indices: list[tuple[int, int]] = []
+        self.pointcloud_first_object_pos_w: list[np.ndarray] = []
+        self.pointcloud_first_object_quat: list[np.ndarray] = []
+        self.pointcloud_env_origin: list[np.ndarray] = []
+        self.pointcloud_first_robot_q_abs: list[np.ndarray] = []
+        self.pointcloud_first_robot_q_obs: list[np.ndarray] = []
 
         self.skipped_short_episodes = 0
         self.skipped_missing_torque_episodes = 0
         self.skipped_missing_object_dynamics_episodes = 0
+        self.skipped_missing_pointcloud_episodes = 0
+        self.skipped_short_pointcloud_episodes = 0
         self.skipped_contact_filtered_windows = 0
         self.episodes_with_contact = 0
 
@@ -155,6 +253,144 @@ class RobotObjectWMRolloutDataset(Dataset):
             contact_consecutive_steps=contact_consecutive_steps,
             contact_settle_steps=contact_settle_steps,
         )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_pointcloud_h5"] = None
+        return state
+
+    def _load_pointcloud_metadata(self) -> None:
+        with h5_open(str(self.pointcloud_file)) as file:
+            data = file[Hdf5Groups.DATA]
+            points = data["object_points"]
+            if points.ndim != 5 or points.shape[-1] != 3:
+                raise ValueError("/data/object_points must have shape (episodes, steps, objects, points, 3).")
+            episodes, steps, num_objects, stored_points, _ = points.shape
+            if self.pointcloud_max_points is None:
+                selected_points = int(stored_points)
+            else:
+                selected_points = int(self.pointcloud_max_points)
+                if selected_points > stored_points:
+                    raise ValueError(
+                        f"pointcloud_max_points={selected_points} exceeds stored points={stored_points}."
+                    )
+            if selected_points < 4:
+                raise ValueError("pointcloud_max_points must be at least 4 for RigidFormer anchors.")
+            if "episode_names" in data:
+                names = _decode_hdf5_strings(data["episode_names"][()])
+            else:
+                names = [f"demo_{index}" for index in range(int(episodes))]
+            if len(names) != int(episodes):
+                raise ValueError(
+                    f"/data/episode_names length {len(names)} does not match object_points episodes {episodes}."
+                )
+            self._pointcloud_episode_to_index = {name: index for index, name in enumerate(names)}
+            self._pointcloud_steps = int(steps)
+            self._pointcloud_num_objects = int(num_objects)
+            self._pointcloud_stored_points = int(stored_points)
+            self._pointcloud_points = int(selected_points)
+            try:
+                config = json.loads(str(file.attrs.get("rigidformer_pointcloud_config", "{}")))
+            except json.JSONDecodeError:
+                config = {}
+            self._pointcloud_dt = float(config.get("control_dt", self.dt))
+            self._pointcloud_gripper_part_ids = infer_gripper_part_ids_from_pointcloud_config(
+                config,
+                selected_points=int(selected_points),
+                stored_points=int(stored_points),
+            )
+
+    @property
+    def pointcloud_h5(self):
+        if self.pointcloud_file is None:
+            raise RuntimeError("pointcloud_file is not configured.")
+        if self._pointcloud_h5 is None:
+            self._pointcloud_h5 = h5_open(str(self.pointcloud_file))
+        return self._pointcloud_h5
+
+    def _pointcloud_vertex_properties(self, episode_index: int) -> np.ndarray:
+        data = self.pointcloud_h5[Hdf5Groups.DATA]
+        if "vertex_properties" not in data:
+            props = np.zeros((self._pointcloud_num_objects, 3), dtype=np.float32)
+            if self._pointcloud_num_objects > 0:
+                props[0] = np.asarray([1.0, 0.0, 1.0], dtype=np.float32)
+            if self._pointcloud_num_objects > 1:
+                props[1] = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            return props
+        dataset = data["vertex_properties"]
+        props = np.asarray(dataset if dataset.ndim == 2 else dataset[episode_index], dtype=np.float32)
+        return props[: self._pointcloud_num_objects]
+
+    def _pointcloud_loss_object_mask(self, episode_index: int) -> np.ndarray:
+        data = self.pointcloud_h5[Hdf5Groups.DATA]
+        if "loss_object_mask" not in data:
+            mask = np.ones((self._pointcloud_num_objects,), dtype=bool)
+            if self._pointcloud_num_objects > 1:
+                mask[1:] = False
+            return mask
+        dataset = data["loss_object_mask"]
+        mask = np.asarray(dataset if dataset.ndim == 1 else dataset[episode_index], dtype=bool)
+        return mask[: self._pointcloud_num_objects]
+
+    def _load_pointcloud_window(self, episode_index: int, frame_index: int) -> dict[str, torch.Tensor]:
+        start = int(frame_index) - 1
+        stop = int(frame_index) + self.rollout_horizon + 1
+        if start < 0 or stop > self._pointcloud_steps:
+            raise IndexError(
+                f"Pointcloud window [{start}, {stop}) exceeds steps={self._pointcloud_steps}."
+            )
+        data = self.pointcloud_h5[Hdf5Groups.DATA]
+        points = np.asarray(
+            data["object_points"][
+                int(episode_index),
+                start:stop,
+                : self._pointcloud_num_objects,
+                : self._pointcloud_points,
+                :,
+            ],
+            dtype=np.float32,
+        )
+        points = np.nan_to_num(points, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        point_lens = np.full((self._pointcloud_num_objects,), self._pointcloud_points, dtype=np.int64)
+        if "object_point_counts" in data:
+            counts = np.asarray(
+                data["object_point_counts"][int(episode_index), start:stop, : self._pointcloud_num_objects],
+                dtype=np.int64,
+            )
+            if counts.ndim == 2:
+                point_lens = np.minimum(point_lens, counts.min(axis=0).clip(min=0))
+
+        return {
+            "pc_delta_times": torch.tensor(self._pointcloud_dt, dtype=torch.float32),
+            "pc_vertex_properties": torch.from_numpy(self._pointcloud_vertex_properties(int(episode_index))),
+            "pc_object_pos_prev": torch.from_numpy(points[0]),
+            "pc_object_pos": torch.from_numpy(points[1]),
+            "pc_object_pos_next": torch.from_numpy(points[2]),
+            "pc_object_pos_rollout": torch.from_numpy(points),
+            "pc_object_first_frame_pos": torch.from_numpy(
+                np.nan_to_num(
+                    np.asarray(
+                        data["object_points"][
+                            int(episode_index),
+                            0,
+                            : self._pointcloud_num_objects,
+                            : self._pointcloud_points,
+                            :,
+                        ],
+                        dtype=np.float32,
+                    ),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32, copy=False)
+            ),
+            "pc_object_point_lens": torch.from_numpy(point_lens),
+            "pc_object_lens": torch.tensor(self._pointcloud_num_objects, dtype=torch.long),
+            "pc_loss_object_mask": torch.from_numpy(self._pointcloud_loss_object_mask(int(episode_index))),
+            "pc_gripper_part_ids": torch.from_numpy(self._pointcloud_gripper_part_ids),
+            "pc_episode_index": torch.tensor(int(episode_index), dtype=torch.long),
+            "pc_frame_index": torch.tensor(int(frame_index), dtype=torch.long),
+        }
 
     def _material_context(self, object_dyn_group, t_count: int) -> np.ndarray:
         if "material_properties" not in object_dyn_group:
@@ -227,6 +463,12 @@ class RobotObjectWMRolloutDataset(Dataset):
                     ]
                     env_origin = self._env_origin(episode) if self.subtract_env_origin else None
                     object_pos = object_pos_w - env_origin[None, :] if env_origin is not None else object_pos_w
+                    pointcloud_episode_index = None
+                    if self.pointcloud_file is not None:
+                        pointcloud_episode_index = self._pointcloud_episode_to_index.get(episode_name)
+                        if pointcloud_episode_index is None:
+                            self.skipped_missing_pointcloud_episodes += 1
+                            continue
                     collision_obs = load_privileged_collision_observation(
                         episode,
                         mode=self.privileged_collision_observation,
@@ -237,6 +479,13 @@ class RobotObjectWMRolloutDataset(Dataset):
 
                     joint_pos = np.asarray(obs["joint_pos"], dtype=np.float32)[:, : self.layout.robot_dof]
                     joint_vel = np.asarray(obs["joint_vel"], dtype=np.float32)[:, : int(self.layout.joint_vel_dim or 0)]
+                    try:
+                        joint_pos_abs = np.asarray(
+                            episode[Hdf5Groups.STATES]["articulation"]["robot"]["joint_position"],
+                            dtype=np.float32,
+                        )[:, : self.layout.robot_dof]
+                    except KeyError:
+                        joint_pos_abs = joint_pos
                     actions = np.asarray(episode[Hdf5Groups.ACTIONS], dtype=np.float32)[:, : self.layout.action_dim]
                     torques = np.asarray(episode[Hdf5Groups.ROBOT_TORQUES][self.torque_key], dtype=np.float32)[
                         :, : self.layout.torque_dim
@@ -250,6 +499,7 @@ class RobotObjectWMRolloutDataset(Dataset):
                         joint_vel.shape[0],
                         actions.shape[0],
                         torques.shape[0],
+                        joint_pos_abs.shape[0],
                         object_pos.shape[0],
                         object_quat.shape[0],
                         object_lin_vel.shape[0],
@@ -259,8 +509,13 @@ class RobotObjectWMRolloutDataset(Dataset):
                     )
                     if collision_obs is not None:
                         t_count = min(t_count, collision_obs.shape[0])
+                    if self.pointcloud_file is not None:
+                        t_count = min(t_count, self._pointcloud_steps)
                     if t_count <= k + h:
                         self.skipped_short_episodes += 1
+                        continue
+                    if self.pointcloud_file is not None and t_count <= max(k, 1) + h:
+                        self.skipped_short_pointcloud_episodes += 1
                         continue
 
                     material = self._material_context(odg, t_count)
@@ -292,7 +547,15 @@ class RobotObjectWMRolloutDataset(Dataset):
                     if contact_t is not None:
                         self.episodes_with_contact += 1
 
-                    for t in range(k, t_count - h):
+                    first_object_pos_w = object_pos_w[0].astype(np.float32, copy=False)
+                    first_object_quat = object_quat[0].astype(np.float32, copy=False)
+                    origin_for_sample = (
+                        env_origin.astype(np.float32, copy=False)
+                        if env_origin is not None
+                        else np.zeros(self.layout.object_pos_dim, dtype=np.float32)
+                    )
+                    min_t = max(k, 1) if self.pointcloud_file is not None else k
+                    for t in range(min_t, t_count - h):
                         if filter_pre_contact and contact_t is not None and (t + h) >= contact_t:
                             self.skipped_contact_filtered_windows += 1
                             continue
@@ -306,6 +569,14 @@ class RobotObjectWMRolloutDataset(Dataset):
                         self.object_context.append(object_context_series[t])
                         self.contact_t_in_window.append(self._contact_index(contact_t, t, h))
                         self.sample_meta.append((hdf5_path, episode_name, t - k, t + h))
+                        if self.pointcloud_file is not None:
+                            assert pointcloud_episode_index is not None
+                            self.pointcloud_indices.append((int(pointcloud_episode_index), int(t)))
+                            self.pointcloud_first_object_pos_w.append(first_object_pos_w)
+                            self.pointcloud_first_object_quat.append(first_object_quat)
+                            self.pointcloud_env_origin.append(origin_for_sample)
+                            self.pointcloud_first_robot_q_abs.append(joint_pos_abs[0].astype(np.float32, copy=False))
+                            self.pointcloud_first_robot_q_obs.append(joint_pos[0].astype(np.float32, copy=False))
 
         if len(self.history_states) == 0:
             raise RuntimeError("No valid robot-object rollout samples were built.")
@@ -318,6 +589,13 @@ class RobotObjectWMRolloutDataset(Dataset):
         self.future_states = np.asarray(self.future_states, dtype=np.float32)
         self.object_context = np.asarray(self.object_context, dtype=np.float32)
         self.contact_t_in_window = np.asarray(self.contact_t_in_window, dtype=np.int64)
+        if self.pointcloud_file is not None:
+            self.pointcloud_indices = np.asarray(self.pointcloud_indices, dtype=np.int64)
+            self.pointcloud_first_object_pos_w = np.asarray(self.pointcloud_first_object_pos_w, dtype=np.float32)
+            self.pointcloud_first_object_quat = np.asarray(self.pointcloud_first_object_quat, dtype=np.float32)
+            self.pointcloud_env_origin = np.asarray(self.pointcloud_env_origin, dtype=np.float32)
+            self.pointcloud_first_robot_q_abs = np.asarray(self.pointcloud_first_robot_q_abs, dtype=np.float32)
+            self.pointcloud_first_robot_q_obs = np.asarray(self.pointcloud_first_robot_q_obs, dtype=np.float32)
 
     @staticmethod
     def _contact_index(contact_t: int | None, t: int, horizon: int) -> int:
@@ -333,7 +611,7 @@ class RobotObjectWMRolloutDataset(Dataset):
         return int(self.history_states.shape[0])
 
     def __getitem__(self, idx: int):
-        return {
+        item = {
             "history_states": torch.from_numpy(self.history_states[idx]),
             "history_actions": torch.from_numpy(self.history_actions[idx]),
             "history_torques": torch.from_numpy(self.history_torques[idx]),
@@ -343,3 +621,12 @@ class RobotObjectWMRolloutDataset(Dataset):
             "object_context": torch.from_numpy(self.object_context[idx]),
             "contact_t_in_window": int(self.contact_t_in_window[idx]),
         }
+        if self.pointcloud_file is not None:
+            episode_index, frame_index = self.pointcloud_indices[idx]
+            item.update(self._load_pointcloud_window(int(episode_index), int(frame_index)))
+            item["pc_first_object_pos_w"] = torch.from_numpy(self.pointcloud_first_object_pos_w[idx])
+            item["pc_first_object_quat"] = torch.from_numpy(self.pointcloud_first_object_quat[idx])
+            item["pc_env_origin"] = torch.from_numpy(self.pointcloud_env_origin[idx])
+            item["pc_first_robot_q_abs"] = torch.from_numpy(self.pointcloud_first_robot_q_abs[idx])
+            item["pc_first_robot_q_obs"] = torch.from_numpy(self.pointcloud_first_robot_q_obs[idx])
+        return item
