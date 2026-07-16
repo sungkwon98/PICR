@@ -136,7 +136,7 @@ def start_training_run(
 ) -> TrainingRun:
     run_name = cfg.run_name or default_run_name()
     run_output_dir = os.path.join(cfg.output_dir, run_name)
-    os.makedirs(run_output_dir, exist_ok=False)
+    os.makedirs(run_output_dir, exist_ok=bool(getattr(cfg, "resume_from", None)))
     best_path = os.path.join(run_output_dir, "best.pt")
     last_path = os.path.join(run_output_dir, "last.pt")
 
@@ -181,12 +181,17 @@ def checkpoint_and_log_epoch(
     val_metrics: Mapping[str, float],
     best_val_loss: float,
 ) -> float:
-    torch.save(checkpoint, run.last_path)
     val_loss = float(val_metrics["loss"])
     is_best = val_loss < best_val_loss
     if is_best:
         best_val_loss = val_loss
-        torch.save(checkpoint, run.best_path)
+
+    checkpoint_to_save = dict(checkpoint)
+    checkpoint_to_save["best_val_loss"] = float(best_val_loss)
+    torch.save(checkpoint_to_save, run.last_path)
+
+    if is_best:
+        torch.save(checkpoint_to_save, run.best_path)
         run.log_best_artifact(epoch=epoch, val_loss=val_loss)
     run.log_epoch(
         epoch=epoch,

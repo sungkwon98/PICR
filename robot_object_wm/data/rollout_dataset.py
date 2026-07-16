@@ -293,7 +293,9 @@ class RobotObjectWMRolloutDataset(Dataset):
                 config = json.loads(str(file.attrs.get("rigidformer_pointcloud_config", "{}")))
             except json.JSONDecodeError:
                 config = {}
-            self._pointcloud_dt = float(config.get("control_dt", self.dt))
+            self._pointcloud_dt = float(
+                config.get("control_dt", file.attrs.get("control_dt", data.attrs.get("control_dt", self.dt)))
+            )
             self._pointcloud_gripper_part_ids = infer_gripper_part_ids_from_pointcloud_config(
                 config,
                 selected_points=int(selected_points),

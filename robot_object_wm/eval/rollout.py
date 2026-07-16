@@ -595,6 +595,12 @@ def parse_eval_args(argv: list[str] | None = None):
     video = parser.add_argument_group("video")
     video.add_argument("--video", action="store_true", default=False)
     video.add_argument("--video_output", type=str, default=None)
+    video.add_argument(
+        "--render_mode",
+        choices=("rollout", "sliding"),
+        default="rollout",
+        help="rollout renders one long open-loop rollout; sliding renders the older per-frame short-horizon preview.",
+    )
     video.add_argument("--fps", type=int, default=25)
     video.add_argument("--max_frames", type=int, default=0)
     video.add_argument("--collision_info", dest="collision_info", action="store_true", default=True)
@@ -663,6 +669,9 @@ def main(argv: list[str] | None = None) -> dict[str, str]:
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             pred_horizon=args.pred_horizon,
+            start_t=args.start_t,
+            rollout_steps=args.rollout_steps,
+            render_mode=args.render_mode,
             fps=args.fps,
             max_frames=args.max_frames,
             device=next(loaded.model.parameters()).device,

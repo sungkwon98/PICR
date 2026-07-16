@@ -153,7 +153,7 @@ def load_episode_pointcloud_data(
             selected_points=point_count,
             stored_points=int(points_ds.shape[-2]),
         )
-        control_dt = float(config.get("control_dt", 0.02))
+        control_dt = float(config.get("control_dt", file.attrs.get("control_dt", data.attrs.get("control_dt", 0.02))))
     return EpisodePointCloudData(
         name=episode_name,
         object_points=object_points,

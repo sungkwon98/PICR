@@ -135,6 +135,7 @@ class TrainConfig:
     num_workers: int
     output_dir: str
     run_name: str | None
+    resume_from: str | None
     wandb_project_name: str
     wandb_entity: str
     wandb_name: str | None
@@ -259,6 +260,7 @@ def _load_config_file(path: str) -> dict[str, Any]:
         "dataset_dir",
         "dataset_file",
         "output_dir",
+        "resume_from",
         "rwm_config",
         "pointcloud_file",
         "rigidformer_config",
@@ -1642,8 +1644,92 @@ def run_periodic_rendering(cfg: TrainConfig, run, *, epoch: int) -> None:
     )
 
 
+def _torch_load_checkpoint(path: str | os.PathLike[str], *, map_location: torch.device | str):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:  # Older PyTorch versions do not expose weights_only.
+        return torch.load(path, map_location=map_location)
+
+
+def _checkpoint_val_loss(checkpoint: Mapping[str, Any]) -> float | None:
+    best_val = checkpoint.get("best_val_loss")
+    if best_val is not None:
+        return float(best_val)
+    val_metrics = checkpoint.get("val_metrics")
+    if isinstance(val_metrics, Mapping) and "loss" in val_metrics:
+        return float(val_metrics["loss"])
+    return None
+
+
+def _prepare_resume_config(cfg: TrainConfig) -> None:
+    if not cfg.resume_from:
+        return
+
+    resume_path = Path(cfg.resume_from).expanduser()
+    if resume_path.is_dir():
+        resume_path = resume_path / "last.pt"
+    resume_path = resume_path.resolve()
+    if not resume_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+    cfg.resume_from = str(resume_path)
+    resume_dir = resume_path.parent
+    if cfg.run_name is None:
+        cfg.run_name = resume_dir.name
+        cfg.output_dir = str(resume_dir.parent)
+
+
+def _load_resume_state(
+    cfg: TrainConfig,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[int, float]:
+    if not cfg.resume_from:
+        return 1, float("inf")
+
+    checkpoint = _torch_load_checkpoint(cfg.resume_from, map_location=device)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Expected checkpoint mapping in {cfg.resume_from}, got {type(checkpoint).__name__}.")
+    if "model_state_dict" not in checkpoint:
+        raise KeyError(f"Checkpoint {cfg.resume_from} does not contain model_state_dict.")
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    if "optimizer_state_dict" in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError as exc:
+            print(f"[WARN] Could not resume optimizer state; continuing with a fresh optimizer: {exc}")
+    else:
+        print(f"[WARN] Resume checkpoint has no optimizer_state_dict: {cfg.resume_from}")
+
+    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+    best_val = _checkpoint_val_loss(checkpoint)
+
+    best_path = Path(cfg.resume_from).with_name("best.pt")
+    if best_path.is_file():
+        try:
+            best_checkpoint = _torch_load_checkpoint(best_path, map_location="cpu")
+            if isinstance(best_checkpoint, Mapping):
+                best_checkpoint_val = _checkpoint_val_loss(best_checkpoint)
+                if best_checkpoint_val is not None:
+                    best_val = best_checkpoint_val if best_val is None else min(float(best_val), float(best_checkpoint_val))
+        except Exception as exc:
+            print(f"[WARN] Could not read previous best checkpoint {best_path}: {exc}")
+
+    if best_val is None:
+        best_val = float("inf")
+
+    print(f"Resumed checkpoint: {cfg.resume_from}")
+    print(f"  checkpoint epoch: {int(checkpoint.get('epoch', 0))}")
+    print(f"  next epoch: {start_epoch}")
+    print(f"  best val loss: {best_val}")
+    return start_epoch, float(best_val)
+
+
 def main(argv: list[str] | None = None) -> None:
     cfg = parse_args(argv)
+    _prepare_resume_config(cfg)
     cfg.action_type = _normalize_action_type(cfg.action_type)
     if cfg.render_every < 0:
         raise ValueError("render_every must be >= 0; use 0 to disable periodic rendering.")
@@ -1678,6 +1764,7 @@ def main(argv: list[str] | None = None) -> None:
     train_loader, val_loader, layout, meta = make_dataloaders(cfg, rigidformer_cfg=rigidformer_cfg)
     model = build_model(cfg, device=device, rwm_cfg=rwm_cfg, rigidformer_cfg=rigidformer_cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    start_epoch, best_val = _load_resume_state(cfg, model, optimizer, device)
     _print_run_header(
         cfg,
         device,
@@ -1689,11 +1776,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     run.update_config({"architecture": model_name, "data_meta": meta})
 
-    best_val = float("inf")
     max_train_batches = _max_batches(train_loader, cfg.train_batch_fraction)
 
     try:
-        for epoch in range(1, cfg.epochs + 1):
+        for epoch in range(start_epoch, cfg.epochs + 1):
             train_metrics = run_epoch(model, train_loader, optimizer, device, cfg, max_train_batches, rwm_cfg)
             val_metrics = run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg)
             print(_format_epoch_summary(epoch, train_metrics, val_metrics))

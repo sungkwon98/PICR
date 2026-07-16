@@ -20,7 +20,7 @@ venv/
 *.hdf5
 *.h5
 *.npz
-
+robot_object_wm/eval_outputs/
 # Logs and temporary files
 *.log
 *.tmp

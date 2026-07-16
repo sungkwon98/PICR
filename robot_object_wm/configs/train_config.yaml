@@ -1,7 +1,7 @@
 # Default TrainConfig for robot-object RWM training.
 
 dataset_dir: ../../rigidformer/data/franka
-dataset_file: ../../rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
+dataset_file: ../dataset/Franka_Lift_policy_free_cube_drop_states_only_100hz_11003ep_collision_augmented.hdf5
 
 # split: robot DeLaN + object MLP
 # whole: one DeLaN over robot + object generalized coordinates
@@ -9,10 +9,10 @@ dataset_file: ../../rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_jo
 # rwm: RWMEnsemble dynamics model configured by rwm_config.yaml
 model_type: hybrid
 rwm_config: rwm_config.yaml
-pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p_11003ep.hdf5
+pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_policy_free_cube_drop_meshfk_posecube_1024p_100hz_11003ep.hdf5
 rigidformer_config: hybrid_rigidformer_config.yaml
 hybrid_robot_model_type: rwm
-hybrid_rollout_feedback_mode: robot_native
+hybrid_rollout_feedback_mode: rigidformer_pose # robot_native or rigidformer_pose 
 hybrid_gripper_pointcloud_mode: predicted_fk # gt or predicted_fk
 robot_loss_weight: 1.0
 rigidformer_loss_weight: 1.0
@@ -23,6 +23,7 @@ history_len: 8
 rollout_horizon: 5
 robot_dof: 9
 action_dim: 8
+
 torque_dim: 9
 action_type: torque  # policy or torque
 # full: joint_pos + joint_vel + object_pos + object_quat + object_lin_vel + object_ang_vel
@@ -36,7 +37,7 @@ torque_key: applied_torque
 # 1: collision flag
 # 2: signed distance
 # 3: signed distance + nearest points
-privileged_collision_observation: 3
+privileged_collision_observation: 0
 privileged_collision_group: privileged_collision
 privileged_collision_pairs: object_ground,object_left_finger,object_right_finger,object_gripper
 privileged_collision_loss_weight: 1.0
@@ -45,10 +46,10 @@ hidden_dim: 256
 object_hidden_dim: 256
 object_depth: 3
 tool_z_offset: 0.1034
-dt: 0.02
+dt: 0.01
 ode_solver: euler  # euler or rk4
 
-batch_size: 256
+batch_size: 128
 epochs: 200
 lr: 1.0e-4
 weight_decay: 1.0e-6
@@ -83,10 +84,11 @@ seed: 42
 num_workers: 4
 output_dir: ../outputs_wm_dynamics
 run_name:
+resume_from:
 log_every_batches: 200
-train_batch_fraction: 0.1
-train_subsample_fraction: 0.2
-val_subsample_fraction: 1.0
+train_batch_fraction: 1.
+train_subsample_fraction: 1.
+val_subsample_fraction: .1
 
 filter_pre_contact: false
 object_displacement_threshold: 0.005
@@ -97,7 +99,7 @@ subtract_env_origin: true
 
 wandb_project_name: world-model
 wandb_entity: tjrcjf410-seoul-national-university
-wandb_name:
+wandb_name: franka_drop_hybrid_rwm_obj_posecube_1024p_100hz
 wandb_mode: online
 wandb_artifacts: true
 
@@ -118,7 +120,7 @@ eval_episode_plot: true
 eval_episode_index: 26
 eval_episode_name:
 eval_start_t: 25
-eval_rollout_steps: 25
+eval_rollout_steps: 0
 eval_target: gripper
 
 eval_prediction_metrics: false

@@ -11,7 +11,7 @@ hybrid_gripper_pointcloud_mode:
 output: ../eval_outputs/isaaclab_gt_vs_wm.mp4
 
 # Episode selection from the dataset.
-episode_index: 26
+episode_index: 0
 episode_name:
 
 # The world model needs history before it can imagine forward. The renderer

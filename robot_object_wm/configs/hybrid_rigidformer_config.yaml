@@ -8,7 +8,7 @@ num_anchors: 4
 object_self_attn_depth: 2
 anchor_cross_attn_depth: 2
 object_hidden_layers:
-anchor_self_attn: true
+anchor_self_attn: false
 use_platonic_transformer: false
 paper_architecture: false
 vertex_feature_dim: 256

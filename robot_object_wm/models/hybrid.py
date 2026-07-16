@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 from typing import Any
 
 import torch
@@ -8,6 +10,9 @@ from torch import nn
 import torch.nn.functional as F
 
 try:
+    _LOCAL_RIGIDFORMER_ROOT = Path(__file__).resolve().parents[2] / "rigidformer"
+    if (_LOCAL_RIGIDFORMER_ROOT / "rigidformer" / "__init__.py").is_file():
+        sys.path.insert(0, str(_LOCAL_RIGIDFORMER_ROOT))
     from rigidformer import Rigidformer
 except ImportError as exc:  # pragma: no cover - environment dependent.
     Rigidformer = None  # type: ignore[assignment]

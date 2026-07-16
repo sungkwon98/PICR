@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import os
 import sys
 from pathlib import Path
@@ -20,9 +21,11 @@ import torch  # noqa: E402
 from robot_object_wm.data.dataset import h5_open
 from robot_object_wm.eval.episode import (
     EpisodeData,
+    EpisodeRollout,
     compute_joint_positions,
     load_episode_data,
     precompute_prediction_trajectories,
+    rollout_episode,
 )
 from robot_object_wm.eval.rollout import load_checkpoint_model
 from robot_object_wm.models.utils import FrankaForwardKinematics
@@ -78,6 +81,9 @@ def render_checkpoint_animation(
     episode_index: int = 0,
     episode_name: str | None = None,
     pred_horizon: int = 10,
+    start_t: int | None = None,
+    rollout_steps: int | None = None,
+    render_mode: str = "rollout",
     fps: int = 25,
     max_frames: int = 0,
     device: torch.device | str | None = None,
@@ -119,6 +125,37 @@ def render_checkpoint_animation(
         if show_collision_info
         else None
     )
+    normalized_mode = str(render_mode).strip().lower()
+    if normalized_mode not in {"rollout", "sliding"}:
+        raise ValueError("render_mode must be 'rollout' or 'sliding'.")
+    if normalized_mode == "rollout":
+        start = max(int(cfg.history_len) - 1, int(start_t if start_t is not None else int(cfg.history_len) - 1))
+        if start >= episode.T - 1:
+            raise ValueError(f"start_t={start} leaves no rollout room for episode length T={episode.T}.")
+        steps = int(rollout_steps or 0)
+        if steps <= 0:
+            steps = episode.T - start - 1
+        rollout = rollout_episode(
+            model,
+            episode,
+            start_t=start,
+            rollout_steps=steps,
+            history_len=cfg.history_len,
+            device=torch_device,
+        )
+        return render_rollout_comparison_animation(
+            episode=episode,
+            rollout=rollout,
+            fk=fk,
+            device=torch_device,
+            output_path=output_path,
+            fps=fps,
+            cube_size=cube_size,
+            show_trails=show_trails,
+            target=target,
+            collision_overlay=collision_overlay,
+        )
+
     pred_target_per_t, pred_object_per_t = precompute_prediction_trajectories(
         model,
         episode,
@@ -240,6 +277,280 @@ def _target_positions_from_joints(joints_3d: np.ndarray, target: str) -> np.ndar
     if idx < 0 or idx >= joints_3d.shape[1]:
         raise ValueError(f"target index must be in [0, {joints_3d.shape[1]}); got {idx}.")
     return joints_3d[:, idx, :]
+
+
+def render_rollout_comparison_animation(
+    *,
+    episode: EpisodeData,
+    rollout: EpisodeRollout,
+    fk: FrankaForwardKinematics,
+    device: torch.device,
+    output_path: str,
+    fps: int = 25,
+    cube_size: float = 0.04,
+    show_trails: bool = True,
+    target: str = "gripper",
+    collision_overlay: CollisionOverlay | None = None,
+) -> str:
+    """Render one open-loop rollout against the GT episode.
+
+    Unlike the older sliding-horizon animation, this runs the model once from
+    ``rollout.start_t`` and visualizes the resulting long prediction sequence.
+    """
+
+    if rollout.steps <= 0:
+        raise ValueError(f"Rollout produced no frames: {rollout.failure_reason or 'unknown failure'}")
+
+    layout = episode.state_layout
+    start_t = int(rollout.start_t)
+    frame_indices = np.arange(start_t + 1, start_t + 1 + rollout.steps, dtype=np.int64)
+
+    q_offset = episode.joint_pos_abs[start_t] - episode.state[start_t, layout.robot_q_slice]
+    pred_q_abs = rollout.pred_states[:, layout.robot_q_slice] + q_offset[None, :]
+    gt_q_abs = episode.joint_pos_abs[frame_indices]
+    pred_joints = compute_joint_positions(pred_q_abs.astype(np.float32), fk, device)
+    gt_joints = compute_joint_positions(gt_q_abs.astype(np.float32), fk, device)
+
+    pred_object_pos = rollout.pred_states[:, layout.object_pos_slice]
+    gt_object_pos = rollout.gt_states[:, layout.object_pos_slice]
+    pred_object_quat = rollout.pred_states[:, layout.object_quat_slice]
+    gt_object_quat = rollout.gt_states[:, layout.object_quat_slice]
+
+    pred_target = _target_positions_from_joints(pred_joints, target)
+    gt_target = _target_positions_from_joints(gt_joints, target)
+    target_error = np.linalg.norm(pred_target - gt_target, axis=-1)
+    object_error = np.linalg.norm(pred_object_pos - gt_object_pos, axis=-1)
+
+    output = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    base = Path(output)
+    metrics_path = base.with_suffix(".metrics.json")
+    trajectory_path = base.with_suffix(".npz")
+    metrics = {
+        "episode": episode.name,
+        "start_t": start_t,
+        "steps": int(rollout.steps),
+        "failed_step": rollout.failed_step,
+        "failure_reason": rollout.failure_reason,
+        f"{target}_position_rmse_m": float(np.sqrt(np.mean(target_error**2))),
+        f"{target}_position_error_final_m": float(target_error[-1]),
+        f"{target}_position_error_max_m": float(np.max(target_error)),
+        "object_position_rmse_m": float(np.sqrt(np.mean(object_error**2))),
+        "object_position_error_final_m": float(object_error[-1]),
+        "object_position_error_max_m": float(np.max(object_error)),
+    }
+    with metrics_path.open("w", encoding="utf-8") as file:
+        json.dump(metrics, file, indent=2)
+    np.savez_compressed(
+        trajectory_path,
+        frame_indices=frame_indices,
+        gt_q_abs=gt_q_abs,
+        pred_q_abs=pred_q_abs,
+        gt_joints=gt_joints,
+        pred_joints=pred_joints,
+        gt_object_pos=gt_object_pos,
+        pred_object_pos=pred_object_pos,
+        gt_object_quat=gt_object_quat,
+        pred_object_quat=pred_object_quat,
+        target_error=target_error,
+        object_error=object_error,
+    )
+
+    fig = plt.figure(figsize=(11, 9))
+    ax = fig.add_subplot(111, projection="3d")
+    _set_bounds_from_points(
+        ax,
+        np.concatenate(
+            [
+                gt_joints.reshape(-1, 3),
+                pred_joints.reshape(-1, 3),
+                gt_object_pos,
+                pred_object_pos,
+                episode.object_pos,
+            ],
+            axis=0,
+        ),
+    )
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_zlabel("z [m]")
+    ax.grid(True, alpha=0.2)
+    ax.view_init(elev=20.0, azim=-60.0)
+
+    ax.plot(
+        episode.object_pos[:, 0],
+        episode.object_pos[:, 1],
+        episode.object_pos[:, 2],
+        color="tab:green",
+        linestyle=":",
+        linewidth=1.2,
+        alpha=0.35,
+        label="Full GT object path",
+    )
+
+    gt_joint_scatter, gt_links = _make_robot_artists(ax, gt_joints[0], color="tab:blue", label="GT robot")
+    pred_joint_scatter, pred_links = _make_robot_artists(ax, pred_joints[0], color="tab:orange", label="Pred robot")
+    gt_cube_lines = _make_cube_artists(ax, gt_object_pos[0], gt_object_quat[0], cube_size, color="tab:green", label="GT cube")
+    pred_cube_lines = _make_cube_artists(
+        ax,
+        pred_object_pos[0],
+        pred_object_quat[0],
+        cube_size,
+        color="tab:purple",
+        label="Pred cube",
+        linestyle="--",
+    )
+
+    nan_coord = np.asarray([np.nan], dtype=np.float32)
+    nan_xyz = (nan_coord, nan_coord, nan_coord)
+    contact_marker = ax.scatter(
+        [np.nan],
+        [np.nan],
+        [np.nan],
+        s=240,
+        marker="*",
+        c="tab:red",
+        edgecolors="black",
+        linewidths=0.8,
+        depthshade=False,
+        label="GT collision",
+        zorder=8,
+    )
+    collision_points_a = ax.scatter(
+        [np.nan],
+        [np.nan],
+        [np.nan],
+        s=70,
+        marker="o",
+        c="tab:cyan",
+        edgecolors="black",
+        linewidths=0.5,
+        depthshade=False,
+        label="collision point A",
+        zorder=9,
+    )
+    collision_points_b = ax.scatter(
+        [np.nan],
+        [np.nan],
+        [np.nan],
+        s=70,
+        marker="X",
+        c="tab:purple",
+        edgecolors="black",
+        linewidths=0.5,
+        depthshade=False,
+        label="collision point B",
+        zorder=9,
+    )
+
+    gt_gripper_trail = gt_cube_trail = pred_gripper_trail = pred_cube_trail = None
+    if show_trails:
+        gt_gripper_trail = ax.plot([], [], [], color="tab:blue", linewidth=1.0, alpha=0.55)[0]
+        gt_cube_trail = ax.plot([], [], [], color="tab:green", linewidth=1.0, alpha=0.55)[0]
+        pred_gripper_trail = ax.plot([], [], [], color="tab:orange", linewidth=1.0, alpha=0.75)[0]
+        pred_cube_trail = ax.plot([], [], [], color="tab:purple", linewidth=1.0, alpha=0.75)[0]
+
+    time_text = ax.text2D(0.02, 0.96, "", transform=ax.transAxes, fontsize=12)
+    error_text = ax.text2D(
+        0.02,
+        0.90,
+        "",
+        transform=ax.transAxes,
+        fontsize=10,
+        bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "0.75", "boxstyle": "round,pad=0.35"},
+    )
+    collision_text = ax.text2D(
+        0.02,
+        0.82,
+        "",
+        transform=ax.transAxes,
+        fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "0.75", "boxstyle": "round,pad=0.25"},
+    )
+    ax.set_title(f"Open-loop rollout comparison | Episode '{episode.name}'")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+
+    def update(local_frame: int):
+        gt_frame = int(frame_indices[local_frame])
+        contact_summary = _collision_summary(collision_overlay, gt_frame)
+
+        _update_robot_artists(gt_joint_scatter, gt_links, gt_joints[local_frame], color="tab:blue")
+        _update_robot_artists(pred_joint_scatter, pred_links, pred_joints[local_frame], color="tab:orange")
+        _update_cube_artists(gt_cube_lines, gt_object_pos[local_frame], gt_object_quat[local_frame], cube_size, color="tab:green")
+        pred_cube_color = "tab:red" if object_error[local_frame] == np.max(object_error[: local_frame + 1]) else "tab:purple"
+        _update_cube_artists(
+            pred_cube_lines,
+            pred_object_pos[local_frame],
+            pred_object_quat[local_frame],
+            cube_size,
+            color=pred_cube_color,
+        )
+
+        if contact_summary["active"]:
+            contact_marker._offsets3d = (
+                gt_object_pos[local_frame : local_frame + 1, 0],
+                gt_object_pos[local_frame : local_frame + 1, 1],
+                gt_object_pos[local_frame : local_frame + 1, 2],
+            )
+        else:
+            contact_marker._offsets3d = nan_xyz
+        points_a, points_b = _collision_points_for_frame(collision_overlay, gt_frame)
+        collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2]) if points_a.size else nan_xyz
+        collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2]) if points_b.size else nan_xyz
+
+        if show_trails:
+            assert gt_gripper_trail is not None and gt_cube_trail is not None
+            assert pred_gripper_trail is not None and pred_cube_trail is not None
+            gt_gripper_trail.set_data_3d(
+                gt_joints[: local_frame + 1, -1, 0],
+                gt_joints[: local_frame + 1, -1, 1],
+                gt_joints[: local_frame + 1, -1, 2],
+            )
+            gt_cube_trail.set_data_3d(
+                gt_object_pos[: local_frame + 1, 0],
+                gt_object_pos[: local_frame + 1, 1],
+                gt_object_pos[: local_frame + 1, 2],
+            )
+            pred_gripper_trail.set_data_3d(
+                pred_joints[: local_frame + 1, -1, 0],
+                pred_joints[: local_frame + 1, -1, 1],
+                pred_joints[: local_frame + 1, -1, 2],
+            )
+            pred_cube_trail.set_data_3d(
+                pred_object_pos[: local_frame + 1, 0],
+                pred_object_pos[: local_frame + 1, 1],
+                pred_object_pos[: local_frame + 1, 2],
+            )
+
+        time_text.set_text(
+            f"dataset step {gt_frame} | rollout {local_frame + 1}/{rollout.steps} | t={gt_frame * episode.dt:.2f}s"
+        )
+        error_text.set_text(
+            f"{target} err={target_error[local_frame]:.4f} m  "
+            f"object err={object_error[local_frame]:.4f} m\n"
+            f"{target} RMSE={metrics[f'{target}_position_rmse_m']:.4f} m  "
+            f"object RMSE={metrics['object_position_rmse_m']:.4f} m"
+        )
+        collision_text.set_text(contact_summary["text"])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=rollout.steps, interval=1000.0 / max(1, fps), blit=False)
+    actual_path = output
+    ext = Path(output).suffix.lower()
+    if ext in (".mp4", ".mov", ".m4v"):
+        try:
+            anim.save(output, writer=FFMpegWriter(fps=fps, bitrate=2600), dpi=120)
+        except Exception as exc:
+            gif_path = str(Path(output).with_suffix(".gif"))
+            print(f"[WARN] FFMpeg writer failed ({exc}); falling back to GIF at {gif_path}.")
+            anim.save(gif_path, writer=PillowWriter(fps=fps), dpi=120)
+            actual_path = gif_path
+    else:
+        anim.save(output, writer=PillowWriter(fps=fps), dpi=120)
+    plt.close(fig)
+    print(f"Saved rollout metrics: {metrics_path}")
+    print(f"Saved rollout trajectory: {trajectory_path}")
+    return actual_path
 
 
 def render_animation(
@@ -555,6 +866,95 @@ def save_point_animation(points: np.ndarray, output_path: str, fps: int = 20) ->
     return path
 
 
+def _make_robot_artists(ax, joints: np.ndarray, *, color: str, label: str):
+    scatter = ax.scatter(
+        joints[:, 0],
+        joints[:, 1],
+        joints[:, 2],
+        s=120,
+        c=color,
+        edgecolors="black",
+        linewidths=0.6,
+        depthshade=True,
+        label=label,
+        zorder=5,
+    )
+    links = []
+    for idx in range(joints.shape[0] - 1):
+        links.append(
+            ax.plot(
+                [joints[idx, 0], joints[idx + 1, 0]],
+                [joints[idx, 1], joints[idx + 1, 1]],
+                [joints[idx, 2], joints[idx + 1, 2]],
+                color=color,
+                linewidth=2.4,
+                alpha=0.9,
+                solid_capstyle="round",
+                zorder=4,
+            )[0]
+        )
+    return scatter, links
+
+
+def _update_robot_artists(scatter, links: list, joints: np.ndarray, *, color: str) -> None:
+    scatter._offsets3d = (joints[:, 0], joints[:, 1], joints[:, 2])
+    for idx, line in enumerate(links):
+        line.set_color(color)
+        line.set_data_3d(
+            [joints[idx, 0], joints[idx + 1, 0]],
+            [joints[idx, 1], joints[idx + 1, 1]],
+            [joints[idx, 2], joints[idx + 1, 2]],
+        )
+
+
+def _make_cube_artists(
+    ax,
+    center: np.ndarray,
+    quat: np.ndarray,
+    size: float,
+    *,
+    color: str,
+    label: str,
+    linestyle: str = "-",
+) -> list:
+    corners = cube_corners(center, quat, size)
+    lines = []
+    for edge_index, edge in enumerate(_CUBE_EDGES):
+        i, j = int(edge[0]), int(edge[1])
+        lines.append(
+            ax.plot(
+                [corners[i, 0], corners[j, 0]],
+                [corners[i, 1], corners[j, 1]],
+                [corners[i, 2], corners[j, 2]],
+                color=color,
+                linestyle=linestyle,
+                linewidth=2.0,
+                label=label if edge_index == 0 else None,
+                zorder=3,
+            )[0]
+        )
+    return lines
+
+
+def _update_cube_artists(
+    lines: list,
+    center: np.ndarray,
+    quat: np.ndarray,
+    size: float,
+    *,
+    color: str,
+) -> None:
+    corners = cube_corners(center, quat, size)
+    for line, edge in zip(lines, _CUBE_EDGES):
+        i, j = int(edge[0]), int(edge[1])
+        line.set_color(color)
+        line.set_data_3d(
+            [corners[i, 0], corners[j, 0]],
+            [corners[i, 1], corners[j, 1]],
+            [corners[i, 2], corners[j, 2]],
+        )
+
+
 def cube_corners(center: np.ndarray, quat: np.ndarray, size: float) -> np.ndarray:
     half = size / 2.0
     return (_CUBE_CORNERS_LOCAL * half) @ _quat_to_rotation_matrix_np(quat).T + center[None, :]
@@ -739,12 +1139,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no_subtract_env_origin", dest="subtract_env_origin", action="store_false", default=True)
     parser.add_argument("--dt", type=float, default=0.02)
     parser.add_argument("--tool_z_offset", type=float, default=0.1034)
+    parser.add_argument(
+        "--render_mode",
+        choices=("rollout", "sliding"),
+        default="rollout",
+        help="rollout renders one long open-loop rollout; sliding renders the older per-frame short-horizon preview.",
+    )
+    parser.add_argument("--start_t", type=int, default=25, help="Dataset frame to start the long rollout animation.")
+    parser.add_argument("--rollout_steps", type=int, default=0, help="Long-rollout steps. 0 means until episode end.")
     parser.add_argument("--pred_horizon", type=int, default=10)
     parser.add_argument("--target", type=str, default="gripper")
     parser.add_argument("--fps", type=int, default=25)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--cube_size", type=float, default=0.04)
-    parser.add_argument("--no_trails", dest="show_trails", action="store_false", default=False)
+    parser.add_argument("--no_trails", dest="show_trails", action="store_false", default=True)
     parser.add_argument("--no_gt_future", dest="show_gt_future", action="store_false", default=False)
     collision = parser.add_argument_group("collision overlay")
     collision.add_argument("--collision_info", dest="show_collision_info", action="store_true", default=True)
@@ -779,6 +1187,9 @@ def main(argv: list[str] | None = None) -> None:
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             pred_horizon=args.pred_horizon,
+            start_t=args.start_t,
+            rollout_steps=args.rollout_steps,
+            render_mode=args.render_mode,
             fps=args.fps,
             max_frames=args.max_frames,
             device=next(loaded.model.parameters()).device,
@@ -846,6 +1257,21 @@ def _set_bounds(
     all_points = np.concatenate(points, axis=0)
     mins = all_points.min(axis=0) - 0.05
     maxs = all_points.max(axis=0) + 0.05
+    center = 0.5 * (mins + maxs)
+    half = max(float((maxs - mins).max()) * 0.5, 0.25)
+    ax.set_xlim(center[0] - half, center[0] + half)
+    ax.set_ylim(center[1] - half, center[1] + half)
+    ax.set_zlim(center[2] - half, center[2] + half)
+    ax.set_box_aspect((1, 1, 1))
+
+
+def _set_bounds_from_points(ax, points: np.ndarray) -> None:
+    finite = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    finite = finite[np.isfinite(finite).all(axis=-1)]
+    if finite.size == 0:
+        finite = np.zeros((1, 3), dtype=np.float32)
+    mins = finite.min(axis=0) - 0.05
+    maxs = finite.max(axis=0) + 0.05
     center = 0.5 * (mins + maxs)
     half = max(float((maxs - mins).max()) * 0.5, 0.25)
     ax.set_xlim(center[0] - half, center[0] + half)
