@@ -603,6 +603,14 @@ def parse_eval_args(argv: list[str] | None = None):
     )
     video.add_argument("--fps", type=int, default=25)
     video.add_argument("--max_frames", type=int, default=0)
+    video.add_argument(
+        "--pointcloud_render_max_points",
+        type=int,
+        default=256,
+        help="Per-object point count drawn in rollout videos. Use <=0 to draw every stored point.",
+    )
+    video.add_argument("--pointclouds", dest="show_pointclouds", action="store_true", default=True)
+    video.add_argument("--no_pointclouds", dest="show_pointclouds", action="store_false")
     video.add_argument("--collision_info", dest="collision_info", action="store_true", default=True)
     video.add_argument("--no_collision_info", dest="collision_info", action="store_false")
     video.add_argument("--collision_group", type=str, default="privileged_collision")
@@ -679,6 +687,8 @@ def main(argv: list[str] | None = None) -> dict[str, str]:
             show_collision_info=args.collision_info,
             collision_group=args.collision_group,
             collision_dataset_file=args.collision_dataset_file,
+            show_pointclouds=args.show_pointclouds,
+            pointcloud_render_max_points=args.pointcloud_render_max_points,
         )
 
     print("===== WMDynamics Evaluation =====")

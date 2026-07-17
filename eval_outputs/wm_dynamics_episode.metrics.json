@@ -1,0 +1,18 @@
+{
+  "episode": "demo_0",
+  "start_t": 7,
+  "steps": 92,
+  "failed_step": null,
+  "failure_reason": null,
+  "gripper_position_rmse_m": 0.001216792268678546,
+  "gripper_position_error_final_m": 0.001782900420948863,
+  "gripper_position_error_max_m": 0.001782900420948863,
+  "object_position_rmse_m": 0.0372365266084671,
+  "object_position_error_final_m": 0.02063808962702751,
+  "object_position_error_max_m": 0.054135195910930634,
+  "pointcloud_overlay_points_per_object": [
+    256,
+    256
+  ],
+  "pointcloud_overlay_has_predicted": true
+}

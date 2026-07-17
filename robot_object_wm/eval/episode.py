@@ -44,6 +44,7 @@ class EpisodeRollout:
     start_t: int
     failed_step: int | None = None
     failure_reason: str | None = None
+    pred_pointclouds: np.ndarray | None = None
 
     @property
     def steps(self) -> int:
@@ -495,9 +496,10 @@ def _rollout_hybrid_episode(
     failure_reason = None
     with torch.inference_mode():
         try:
-            pred = model(history_states, future_torques, **kwargs)
+            pred, aux_steps = model(history_states, future_torques, return_aux=True, **kwargs)
         except RuntimeError as exc:
             pred = history_states.new_empty((1, 0, episode.state.shape[-1]))
+            aux_steps = []
             failed_step = 0
             failure_reason = f"model rollout failed: {exc}"
 
@@ -510,6 +512,12 @@ def _rollout_hybrid_episode(
             failed_step = first_bad
             failure_reason = "non-finite predicted state"
 
+    pred_pointclouds = None
+    if aux_steps and all("rigidformer_points" in aux for aux in aux_steps[: pred_np.shape[0]]):
+        pred_pointclouds = torch.stack(
+            [aux["rigidformer_points"].detach().cpu()[0] for aux in aux_steps[: pred_np.shape[0]]], dim=0
+        ).numpy().astype(np.float32, copy=False)
+
     gt_states = episode.state[start_t + 1 : start_t + 1 + pred_np.shape[0]]
     return EpisodeRollout(
         pred_states=pred_np,
@@ -517,6 +525,7 @@ def _rollout_hybrid_episode(
         start_t=start_t,
         failed_step=failed_step,
         failure_reason=failure_reason,
+        pred_pointclouds=pred_pointclouds,
     )
 
 

@@ -21,9 +21,12 @@ import torch  # noqa: E402
 from robot_object_wm.data.dataset import h5_open
 from robot_object_wm.eval.episode import (
     EpisodeData,
+    EpisodePointCloudData,
     EpisodeRollout,
+    _pointcloud_batch_for_rollout,
     compute_joint_positions,
     load_episode_data,
+    load_episode_pointcloud_data,
     precompute_prediction_trajectories,
     rollout_episode,
 )
@@ -94,6 +97,8 @@ def render_checkpoint_animation(
     show_collision_info: bool = True,
     collision_group: str = "privileged_collision",
     collision_dataset_file: str | None = None,
+    show_pointclouds: bool = True,
+    pointcloud_render_max_points: int = 256,
 ) -> str:
     torch_device = torch.device(device or next(model.parameters()).device)
     episode = load_episode_data(
@@ -143,6 +148,18 @@ def render_checkpoint_animation(
             history_len=cfg.history_len,
             device=torch_device,
         )
+        gt_pointclouds = pred_pointclouds = None
+        pointcloud_lens = None
+        if show_pointclouds:
+            gt_pointclouds, pred_pointclouds, pointcloud_lens = _prepare_rollout_pointcloud_overlays(
+                model=model,
+                cfg=cfg,
+                episode=episode,
+                rollout=rollout,
+                history_len=cfg.history_len,
+                device=torch_device,
+                pointcloud_render_max_points=pointcloud_render_max_points,
+            )
         return render_rollout_comparison_animation(
             episode=episode,
             rollout=rollout,
@@ -154,6 +171,9 @@ def render_checkpoint_animation(
             show_trails=show_trails,
             target=target,
             collision_overlay=collision_overlay,
+            gt_pointclouds=gt_pointclouds,
+            pred_pointclouds=pred_pointclouds,
+            pointcloud_lens=pointcloud_lens,
         )
 
     pred_target_per_t, pred_object_per_t = precompute_prediction_trajectories(
@@ -279,6 +299,154 @@ def _target_positions_from_joints(joints_3d: np.ndarray, target: str) -> np.ndar
     return joints_3d[:, idx, :]
 
 
+def _model_pointcloud_file(model: torch.nn.Module, cfg) -> str | None:
+    for value in (getattr(model, "pointcloud_file", None), getattr(cfg, "pointcloud_file", None)):
+        if value:
+            return os.path.abspath(str(value))
+    return None
+
+
+def _prepare_rollout_pointcloud_overlays(
+    *,
+    model: torch.nn.Module,
+    cfg,
+    episode: EpisodeData,
+    rollout: EpisodeRollout,
+    history_len: int,
+    device: torch.device,
+    pointcloud_render_max_points: int,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Load GT rollout point clouds and predict the open-loop point clouds for rendering."""
+
+    if rollout.steps <= 0:
+        return None, None, None
+    pointcloud_file = _model_pointcloud_file(model, cfg)
+    if not pointcloud_file:
+        return None, None, None
+    try:
+        model_points = int(getattr(model, "rigidformer_max_points", 0) or 0)
+        render_points = int(pointcloud_render_max_points or 0)
+        max_points = max(model_points, render_points, 1)
+        pc_episode = load_episode_pointcloud_data(pointcloud_file, episode.name, max_points=max_points)
+        start = int(rollout.start_t)
+        stop = start + 1 + int(rollout.steps)
+        if stop > pc_episode.T:
+            raise ValueError(f"pointcloud episode is too short: need frame {stop - 1}, T={pc_episode.T}")
+        gt_points = pc_episode.object_points[start + 1 : stop].astype(np.float32, copy=False)
+        # Use the points from the same forward pass that produced pred_states.
+        # Replaying the stateful hybrid model here can accumulate a different
+        # trajectory, making the rendered cloud disagree with its fitted pose.
+        pred_points = rollout.pred_pointclouds
+        gt_render, pred_render, render_lens = _downsample_rollout_pointclouds(
+            gt_points,
+            pred_points,
+            pc_episode.object_point_lens,
+            max_points=pointcloud_render_max_points,
+        )
+        if pred_render is None:
+            print(f"[INFO] Loaded GT pointcloud overlay from {pointcloud_file}; predicted pointcloud overlay unavailable.")
+        else:
+            print(f"[INFO] Loaded GT + predicted pointcloud overlays from {pointcloud_file}.")
+        return gt_render, pred_render, render_lens
+    except Exception as exc:
+        print(f"[WARN] Could not prepare pointcloud overlay: {exc}")
+        return None, None, None
+
+
+def _predict_rollout_pointclouds(
+    *,
+    model: torch.nn.Module,
+    episode: EpisodeData,
+    pc_episode: EpisodePointCloudData,
+    rollout: EpisodeRollout,
+    history_len: int,
+    device: torch.device,
+) -> np.ndarray | None:
+    """Mirror the hybrid rollout's RigidFormer pointcloud update for visualization."""
+
+    if not hasattr(model, "_prepare_rigidformer_rollout_state") or not hasattr(model, "_rigidformer_rollout_step"):
+        return None
+    if rollout.steps <= 0:
+        return None
+
+    pointcloud_batch = _pointcloud_batch_for_rollout(
+        pc_episode,
+        episode,
+        start_t=int(rollout.start_t),
+        rollout_steps=int(rollout.steps),
+    )
+    start_t = int(rollout.start_t)
+    history_states = torch.from_numpy(episode.state[start_t - history_len + 1 : start_t + 1][None]).to(device)
+    pred_states = torch.from_numpy(rollout.pred_states[None]).to(device)
+    gripper_mode = str(getattr(model, "gripper_pointcloud_mode", "gt")).strip().lower()
+
+    pred_points: list[torch.Tensor] = []
+    with torch.inference_mode():
+        rf_state = model._prepare_rigidformer_rollout_state(
+            pointcloud_batch,
+            int(rollout.steps),
+            history_states=history_states,
+            gripper_mode=gripper_mode,
+            device=device,
+        )
+        if rf_state is None:
+            return None
+        for step in range(int(rollout.steps)):
+            rf_step = model._rigidformer_rollout_step(
+                rf_state,
+                step,
+                next_robot_state=pred_states[:, step],
+                gripper_mode=gripper_mode,
+            )
+            pred_points.append(rf_step["points"].detach().cpu()[0])
+    return torch.stack(pred_points, dim=0).numpy().astype(np.float32, copy=False)
+
+
+def _downsample_rollout_pointclouds(
+    gt_points: np.ndarray,
+    pred_points: np.ndarray | None,
+    point_lens: np.ndarray,
+    *,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Select a deterministic subset of each object's points for animation."""
+
+    gt = np.asarray(gt_points, dtype=np.float32)
+    if gt.ndim != 4 or gt.shape[-1] != 3:
+        raise ValueError(f"Expected GT pointcloud shape (T, O, P, 3), got {gt.shape}.")
+    pred = None if pred_points is None else np.asarray(pred_points, dtype=np.float32)
+    if pred is not None and pred.shape[:3] != gt.shape[:3]:
+        raise ValueError(f"Predicted pointcloud shape {pred.shape} does not match GT shape {gt.shape}.")
+
+    object_count = int(gt.shape[1])
+    stored_points = int(gt.shape[2])
+    lens = np.asarray(point_lens, dtype=np.int64).reshape(-1)
+    if lens.size < object_count:
+        lens = np.pad(lens, (0, object_count - lens.size), constant_values=stored_points)
+    lens = np.clip(lens[:object_count], 0, stored_points)
+    render_limit = stored_points if int(max_points or 0) <= 0 else min(stored_points, int(max_points))
+    render_lens = np.minimum(lens, render_limit).astype(np.int64, copy=False)
+    render_width = max(int(render_lens.max(initial=0)), 1)
+
+    gt_render = np.zeros((gt.shape[0], object_count, render_width, 3), dtype=np.float32)
+    pred_render = None if pred is None else np.zeros_like(gt_render)
+    for object_idx in range(object_count):
+        count = int(lens[object_idx])
+        if count <= 0:
+            continue
+        selected_count = int(render_lens[object_idx])
+        if selected_count <= 0:
+            continue
+        if count > selected_count:
+            indices = np.linspace(0, count - 1, selected_count, dtype=np.int64)
+        else:
+            indices = np.arange(count, dtype=np.int64)
+        gt_render[:, object_idx, : indices.size] = gt[:, object_idx, indices]
+        if pred_render is not None and pred is not None:
+            pred_render[:, object_idx, : indices.size] = pred[:, object_idx, indices]
+    return gt_render, pred_render, render_lens
+
+
 def render_rollout_comparison_animation(
     *,
     episode: EpisodeData,
@@ -291,6 +459,9 @@ def render_rollout_comparison_animation(
     show_trails: bool = True,
     target: str = "gripper",
     collision_overlay: CollisionOverlay | None = None,
+    gt_pointclouds: np.ndarray | None = None,
+    pred_pointclouds: np.ndarray | None = None,
+    pointcloud_lens: np.ndarray | None = None,
 ) -> str:
     """Render one open-loop rollout against the GT episode.
 
@@ -339,37 +510,55 @@ def render_rollout_comparison_animation(
         "object_position_error_final_m": float(object_error[-1]),
         "object_position_error_max_m": float(np.max(object_error)),
     }
+    if gt_pointclouds is not None:
+        metrics["pointcloud_overlay_points_per_object"] = (
+            np.asarray(pointcloud_lens, dtype=np.int64).tolist()
+            if pointcloud_lens is not None
+            else [int(gt_pointclouds.shape[2])] * int(gt_pointclouds.shape[1])
+        )
+        metrics["pointcloud_overlay_has_predicted"] = pred_pointclouds is not None
     with metrics_path.open("w", encoding="utf-8") as file:
         json.dump(metrics, file, indent=2)
-    np.savez_compressed(
-        trajectory_path,
-        frame_indices=frame_indices,
-        gt_q_abs=gt_q_abs,
-        pred_q_abs=pred_q_abs,
-        gt_joints=gt_joints,
-        pred_joints=pred_joints,
-        gt_object_pos=gt_object_pos,
-        pred_object_pos=pred_object_pos,
-        gt_object_quat=gt_object_quat,
-        pred_object_quat=pred_object_quat,
-        target_error=target_error,
-        object_error=object_error,
-    )
+    trajectory_payload = {
+        "frame_indices": frame_indices,
+        "gt_q_abs": gt_q_abs,
+        "pred_q_abs": pred_q_abs,
+        "gt_joints": gt_joints,
+        "pred_joints": pred_joints,
+        "gt_object_pos": gt_object_pos,
+        "pred_object_pos": pred_object_pos,
+        "gt_object_quat": gt_object_quat,
+        "pred_object_quat": pred_object_quat,
+        "target_error": target_error,
+        "object_error": object_error,
+    }
+    if gt_pointclouds is not None:
+        trajectory_payload["gt_pointclouds_render"] = gt_pointclouds
+        trajectory_payload["pointcloud_lens_render"] = (
+            np.asarray(pointcloud_lens, dtype=np.int64)
+            if pointcloud_lens is not None
+            else np.full((gt_pointclouds.shape[1],), gt_pointclouds.shape[2], dtype=np.int64)
+        )
+    if pred_pointclouds is not None:
+        trajectory_payload["pred_pointclouds_render"] = pred_pointclouds
+    np.savez_compressed(trajectory_path, **trajectory_payload)
 
     fig = plt.figure(figsize=(11, 9))
     ax = fig.add_subplot(111, projection="3d")
+    bounds_points = [
+        gt_joints.reshape(-1, 3),
+        pred_joints.reshape(-1, 3),
+        gt_object_pos,
+        pred_object_pos,
+        episode.object_pos,
+    ]
+    if gt_pointclouds is not None:
+        bounds_points.append(_flatten_valid_pointclouds(gt_pointclouds, pointcloud_lens))
+    if pred_pointclouds is not None:
+        bounds_points.append(_flatten_valid_pointclouds(pred_pointclouds, pointcloud_lens))
     _set_bounds_from_points(
         ax,
-        np.concatenate(
-            [
-                gt_joints.reshape(-1, 3),
-                pred_joints.reshape(-1, 3),
-                gt_object_pos,
-                pred_object_pos,
-                episode.object_pos,
-            ],
-            axis=0,
-        ),
+        np.concatenate([points for points in bounds_points if points.size > 0], axis=0),
     )
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
@@ -403,6 +592,7 @@ def render_rollout_comparison_animation(
 
     nan_coord = np.asarray([np.nan], dtype=np.float32)
     nan_xyz = (nan_coord, nan_coord, nan_coord)
+    pointcloud_artists = _make_pointcloud_artists(ax, gt_pointclouds, pred_pointclouds, pointcloud_lens)
     contact_marker = ax.scatter(
         [np.nan],
         [np.nan],
@@ -497,6 +687,9 @@ def render_rollout_comparison_animation(
         points_a, points_b = _collision_points_for_frame(collision_overlay, gt_frame)
         collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2]) if points_a.size else nan_xyz
         collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2]) if points_b.size else nan_xyz
+        for artist, sequence, object_idx in pointcloud_artists:
+            points = _pointcloud_points_for_frame(sequence, pointcloud_lens, local_frame, object_idx)
+            artist._offsets3d = (points[:, 0], points[:, 1], points[:, 2]) if points.size else nan_xyz
 
         if show_trails:
             assert gt_gripper_trail is not None and gt_cube_trail is not None
@@ -955,6 +1148,96 @@ def _update_cube_artists(
         )
 
 
+def _pointcloud_object_name(object_idx: int) -> str:
+    if object_idx == 0:
+        return "cube"
+    if object_idx == 1:
+        return "gripper"
+    return f"object {object_idx}"
+
+
+def _pointcloud_color(kind: str, object_idx: int) -> str:
+    if kind == "gt":
+        return ["#2ca02c", "#17becf", "#8c564b", "#7f7f7f"][object_idx % 4]
+    return ["#d62728", "#ff7f0e", "#9467bd", "#bcbd22"][object_idx % 4]
+
+
+def _pointcloud_points_for_frame(
+    sequence: np.ndarray | None,
+    point_lens: np.ndarray | None,
+    frame: int,
+    object_idx: int,
+) -> np.ndarray:
+    empty = np.zeros((0, 3), dtype=np.float32)
+    if sequence is None or sequence.ndim != 4 or frame < 0 or frame >= sequence.shape[0]:
+        return empty
+    if object_idx < 0 or object_idx >= sequence.shape[1]:
+        return empty
+    max_count = int(sequence.shape[2])
+    if point_lens is None:
+        count = max_count
+    else:
+        lens = np.asarray(point_lens, dtype=np.int64).reshape(-1)
+        count = int(lens[object_idx]) if object_idx < lens.size else max_count
+        count = max(0, min(count, max_count))
+    if count <= 0:
+        return empty
+    points = np.asarray(sequence[frame, object_idx, :count], dtype=np.float32)
+    points = points[np.isfinite(points).all(axis=-1)]
+    return points.astype(np.float32, copy=False)
+
+
+def _flatten_valid_pointclouds(sequence: np.ndarray | None, point_lens: np.ndarray | None) -> np.ndarray:
+    if sequence is None or sequence.ndim != 4:
+        return np.zeros((0, 3), dtype=np.float32)
+    parts = [
+        _pointcloud_points_for_frame(sequence, point_lens, frame, object_idx)
+        for frame in range(sequence.shape[0])
+        for object_idx in range(sequence.shape[1])
+    ]
+    parts = [points for points in parts if points.size > 0]
+    if not parts:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+
+
+def _make_pointcloud_artists(
+    ax,
+    gt_pointclouds: np.ndarray | None,
+    pred_pointclouds: np.ndarray | None,
+    point_lens: np.ndarray | None,
+):
+    artists = []
+    for kind, sequence, marker, alpha, size in (
+        ("gt", gt_pointclouds, ".", 0.30, 8),
+        ("pred", pred_pointclouds, "x", 0.42, 9),
+    ):
+        if sequence is None or sequence.ndim != 4:
+            continue
+        for object_idx in range(sequence.shape[1]):
+            points = _pointcloud_points_for_frame(sequence, point_lens, 0, object_idx)
+            if points.size == 0:
+                x = y = z = np.asarray([np.nan], dtype=np.float32)
+            else:
+                x, y, z = points[:, 0], points[:, 1], points[:, 2]
+            label = f"{kind.upper()} {_pointcloud_object_name(object_idx)} points"
+            scatter = ax.scatter(
+                x,
+                y,
+                z,
+                s=size,
+                marker=marker,
+                c=_pointcloud_color(kind, object_idx),
+                alpha=alpha,
+                linewidths=0.35,
+                depthshade=False,
+                label=label,
+                zorder=2,
+            )
+            artists.append((scatter, sequence, object_idx))
+    return artists
+
+
 def cube_corners(center: np.ndarray, quat: np.ndarray, size: float) -> np.ndarray:
     half = size / 2.0
     return (_CUBE_CORNERS_LOCAL * half) @ _quat_to_rotation_matrix_np(quat).T + center[None, :]
@@ -1120,6 +1403,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default="./outputs_wm_dynamics/run_20260622_100149/best.pt")
     parser.add_argument("--pointcloud_file", type=str, default=None)
     parser.add_argument(
+        "--pointcloud_render_max_points",
+        type=int,
+        default=256,
+        help="Per-object point count drawn in the video. Use <=0 to draw every stored point.",
+    )
+    parser.add_argument("--pointclouds", dest="show_pointclouds", action="store_true", default=True)
+    parser.add_argument("--no_pointclouds", dest="show_pointclouds", action="store_false")
+    parser.add_argument(
         "--hybrid_rollout_feedback_mode",
         choices=("robot_native", "rigidformer_pose"),
         default=None,
@@ -1145,7 +1436,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="rollout",
         help="rollout renders one long open-loop rollout; sliding renders the older per-frame short-horizon preview.",
     )
-    parser.add_argument("--start_t", type=int, default=25, help="Dataset frame to start the long rollout animation.")
+    parser.add_argument("--start_t", type=int, default=0, help="Dataset frame to start the long rollout animation.")
     parser.add_argument("--rollout_steps", type=int, default=0, help="Long-rollout steps. 0 means until episode end.")
     parser.add_argument("--pred_horizon", type=int, default=10)
     parser.add_argument("--target", type=str, default="gripper")
@@ -1200,6 +1491,8 @@ def main(argv: list[str] | None = None) -> None:
             show_collision_info=args.show_collision_info,
             collision_group=args.collision_group,
             collision_dataset_file=args.collision_dataset_file,
+            show_pointclouds=args.show_pointclouds,
+            pointcloud_render_max_points=args.pointcloud_render_max_points,
         )
     else:
         written = render_dataset_animation(

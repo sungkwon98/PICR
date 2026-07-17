@@ -464,7 +464,10 @@ class HybridRigidFormerWMDynamics(nn.Module):
                 feedback_state = output_state if feedback_mode == "rigidformer_pose" else robot_pred
                 x_state = feedback_state.unsqueeze(1)
                 prev_output_state = output_state.detach()
-                aux_steps.append({"rwm_aleatoric": aleatoric, "rwm_epistemic": epistemic})
+                aux = {"rwm_aleatoric": aleatoric, "rwm_epistemic": epistemic}
+                if rf_step is not None:
+                    aux["rigidformer_points"] = rf_step["points"]
+                aux_steps.append(aux)
         finally:
             self.robot.reset()
         return torch.stack(pred_steps, dim=1), aux_steps
@@ -511,7 +514,10 @@ class HybridRigidFormerWMDynamics(nn.Module):
             history_window = torch.cat([history_window[:, 1:], feedback_state[:, None]], dim=1)
             state = feedback_state
             prev_output_state = output_state.detach()
-            aux_steps.append(robot_out.aux)
+            aux = dict(robot_out.aux)
+            if rf_step is not None:
+                aux["rigidformer_points"] = rf_step["points"]
+            aux_steps.append(aux)
         return torch.stack(pred_steps, dim=1), aux_steps
 
     def _replace_with_rf_pose(
