@@ -47,6 +47,11 @@ def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("gt", "predicted_fk"),
         default=None,
     )
+    parser.add_argument(
+        "--hybrid_rigidformer_predict_objects",
+        choices=("cube", "cube_gripper"),
+        default=None,
+    )
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--episode_index", type=int, default=None)
@@ -213,6 +218,10 @@ def main() -> str:
         wm_cfg.hybrid_gripper_pointcloud_mode = config["hybrid_gripper_pointcloud_mode"]
         if hasattr(loaded.model, "gripper_pointcloud_mode"):
             loaded.model.gripper_pointcloud_mode = config["hybrid_gripper_pointcloud_mode"]
+    if config.get("hybrid_rigidformer_predict_objects"):
+        wm_cfg.hybrid_rigidformer_predict_objects = config["hybrid_rigidformer_predict_objects"]
+        if hasattr(loaded.model, "rigidformer_predict_objects"):
+            loaded.model.rigidformer_predict_objects = config["hybrid_rigidformer_predict_objects"]
 
     visual_episode = load_visual_episode(
         config["dataset_file"],
@@ -290,6 +299,7 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         "pointcloud_file": None,
         "hybrid_rollout_feedback_mode": None,
         "hybrid_gripper_pointcloud_mode": None,
+        "hybrid_rigidformer_predict_objects": None,
         "output": "../eval_outputs/isaaclab_gt_vs_wm.mp4",
         "episode_index": 0,
         "episode_name": None,
@@ -327,6 +337,7 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         "pointcloud_file",
         "hybrid_rollout_feedback_mode",
         "hybrid_gripper_pointcloud_mode",
+        "hybrid_rigidformer_predict_objects",
         "fps",
         "video_width",
         "video_height",

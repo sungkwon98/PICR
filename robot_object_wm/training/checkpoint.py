@@ -38,7 +38,7 @@ class TrainingRun:
         self,
         epoch: int,
         train_metrics: Mapping[str, float],
-        val_metrics: Mapping[str, float],
+        val_metrics: Mapping[str, float] | None,
         best_val_loss: float,
         is_best: bool,
     ) -> None:
@@ -50,7 +50,8 @@ class TrainingRun:
             "is_best": bool(is_best),
         }
         payload.update({f"train/{key}": float(value) for key, value in train_metrics.items()})
-        payload.update({f"val/{key}": float(value) for key, value in val_metrics.items()})
+        if val_metrics:
+            payload.update({f"val/{key}": float(value) for key, value in val_metrics.items()})
         try:
             self.wandb_run.log(payload, step=epoch)
         except Exception as exc:  # pragma: no cover - W&B service dependent.
@@ -178,19 +179,20 @@ def checkpoint_and_log_epoch(
     epoch: int,
     checkpoint: Mapping[str, Any],
     train_metrics: Mapping[str, float],
-    val_metrics: Mapping[str, float],
+    val_metrics: Mapping[str, float] | None,
     best_val_loss: float,
 ) -> float:
-    val_loss = float(val_metrics["loss"])
-    is_best = val_loss < best_val_loss
-    if is_best:
+    has_validation = val_metrics is not None and "loss" in val_metrics
+    val_loss = float(val_metrics["loss"]) if has_validation else None
+    is_best = bool(has_validation and val_loss is not None and val_loss < best_val_loss)
+    if is_best and val_loss is not None:
         best_val_loss = val_loss
 
     checkpoint_to_save = dict(checkpoint)
     checkpoint_to_save["best_val_loss"] = float(best_val_loss)
     torch.save(checkpoint_to_save, run.last_path)
 
-    if is_best:
+    if is_best and val_loss is not None:
         torch.save(checkpoint_to_save, run.best_path)
         run.log_best_artifact(epoch=epoch, val_loss=val_loss)
     run.log_epoch(

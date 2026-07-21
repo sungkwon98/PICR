@@ -27,3 +27,4 @@ robot_object_wm/eval_outputs/
 robot_object_wm/dataset/
 # OS/editor noise
 .DS_Store
+eval_outputs/

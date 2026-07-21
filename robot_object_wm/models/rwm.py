@@ -164,6 +164,7 @@ class RWMEnsemble(nn.Module):
         ensemble_size: int = 1,
         history_horizon: int = 1,
         architecture_config: dict = None,
+        prediction_indices=None,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -172,6 +173,17 @@ class RWMEnsemble(nn.Module):
         self.ensemble_size = ensemble_size
         self.history_horizon = history_horizon
         self.architecture_config = architecture_config
+        if prediction_indices is None:
+            self.prediction_indices = None
+            self.output_dim = int(state_dim)
+        else:
+            indices = torch.as_tensor(prediction_indices, dtype=torch.long, device=self.device)
+            if indices.ndim != 1 or indices.numel() == 0:
+                raise ValueError("prediction_indices must be a non-empty 1D index list.")
+            if int(indices.min().item()) < 0 or int(indices.max().item()) >= int(state_dim):
+                raise ValueError(f"prediction_indices must be within [0, {state_dim}).")
+            self.register_buffer("prediction_indices", indices, persistent=False)
+            self.output_dim = int(indices.numel())
         self._init_networks()
 
     def _init_networks(self):
@@ -179,7 +191,7 @@ class RWMEnsemble(nn.Module):
         self.state_heads = nn.ModuleList([
             MLPStateHead(
                 self.base_output_dim,
-                self.state_dim,
+                self.output_dim,
                 self.device,
                 self.architecture_config
             ).to(self.device) for _ in range(self.ensemble_size)
@@ -209,9 +221,10 @@ class RWMEnsemble(nn.Module):
     def forward(self, x_state_batch, x_action_batch, model_ids=None):
         state_means, state_stds = [], []
         state_base_output = self.state_base(x_state_batch, x_action_batch)
+        residual_state_batch = self._prediction_state(x_state_batch)
         
         for head in self.state_heads:
-            state_mean, state_std = head(state_base_output, x_state_batch)
+            state_mean, state_std = head(state_base_output, residual_state_batch)
             if self.prediction_type == "sequence":
                 state_mean = state_mean[:, -1]
                 state_std = state_std[:, -1]
@@ -224,11 +237,28 @@ class RWMEnsemble(nn.Module):
         if model_ids is None:
             output_state_means = state_means.mean(dim=0)
         else:
-            output_state_means = torch.gather(state_means, 0, model_ids.repeat(1, 1, self.state_dim)).squeeze(0)
+            output_state_means = torch.gather(state_means, 0, model_ids.repeat(1, 1, self.output_dim)).squeeze(0)
         
         aleatoric_uncertainty = state_stds.mean(dim=0).sum(dim=1)
         epistemic_uncertainty = state_means.std(dim=0).sum(dim=1) if self.ensemble_size > 1 else torch.zeros(output_state_means.shape[0], device=self.device)
         return output_state_means, aleatoric_uncertainty, epistemic_uncertainty
+
+    def _prediction_state(self, state_batch):
+        if self.prediction_indices is None:
+            return state_batch
+        return state_batch.index_select(-1, self.prediction_indices)
+
+    def _prediction_target(self, state_target):
+        if self.prediction_indices is None:
+            return state_target
+        return state_target.index_select(-1, self.prediction_indices)
+
+    def _compose_full_state(self, predicted_state, base_state):
+        if self.prediction_indices is None:
+            return predicted_state
+        full_state = base_state.clone()
+        full_state.index_copy_(-1, self.prediction_indices, predicted_state)
+        return full_state
 
     def compute_loss(self, state_batch, action_batch, bootstrap=False, state_loss_mask=None):
         state_losses = []
@@ -272,9 +302,12 @@ class RWMEnsemble(nn.Module):
         
         for i in range(forecast_horizon):
             if self.prediction_type == "single":
-                state_target = state_batch[:, self.history_horizon + i]
+                state_target_full = state_batch[:, self.history_horizon + i]
+                state_target = self._prediction_target(state_target_full)
             elif self.prediction_type == "sequence":
                 state_target = state_batch[:, i + 1:self.history_horizon + i + 1]
+                if self.prediction_indices is not None:
+                    state_target = self._prediction_target(state_target)
             else:
                 raise ValueError("Invalid state prediction type.")
             
@@ -285,7 +318,10 @@ class RWMEnsemble(nn.Module):
             else:
                 x_action_batch = action_batch[:, i + 1:self.history_horizon + i + 1]
             
-            state_mean_pred, state_std_pred = head.forward(self.state_base.forward(x_state_batch, x_action_batch), x_state_batch)
+            state_mean_pred, state_std_pred = head.forward(
+                self.state_base.forward(x_state_batch, x_action_batch),
+                self._prediction_state(x_state_batch),
+            )
             state_loss, sequence_loss = self.compute_regression_loss(
                 state_mean_pred,
                 state_std_pred,
@@ -303,14 +339,26 @@ class RWMEnsemble(nn.Module):
             if self.prediction_type == "sequence":
                 state_mean_pred = state_mean_pred[:, -1]
                 state_std_pred = state_std_pred[:, -1]
+
+            sampled_pred = (
+                torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred
+                if head.output_std
+                else state_mean_pred
+            )
+            if self.prediction_indices is not None:
+                if self.prediction_type != "single":
+                    raise ValueError("prediction_indices currently supports prediction_type='single' only.")
+                next_state = self._compose_full_state(sampled_pred, state_target_full)
+            else:
+                next_state = sampled_pred
             
             if self.architecture_config["type"] in ["rnn", "rssm"]:
-                x_state_batch = (torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred).unsqueeze(1) if head.output_std else state_mean_pred.unsqueeze(1)
+                x_state_batch = next_state.unsqueeze(1)
             else:
                 x_state_batch = torch.cat(
                     [
                         x_state_batch[:, 1:].clone(),
-                        (torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred).unsqueeze(1) if head.output_std else state_mean_pred.unsqueeze(1),
+                        next_state.unsqueeze(1),
                     ],
                     dim=1
                 )
@@ -357,9 +405,11 @@ class RWMEnsemble(nn.Module):
         if state_loss_mask is None:
             return None
         mask = torch.as_tensor(state_loss_mask, device=reference.device, dtype=reference.dtype)
-        if mask.shape[-1] != self.state_dim:
-            raise ValueError(f"Expected state_loss_mask dim {self.state_dim}, got {mask.shape[-1]}.")
-        return mask.reshape(1, self.state_dim)
+        if self.prediction_indices is not None and mask.shape[-1] == self.state_dim:
+            mask = mask.index_select(-1, self.prediction_indices)
+        if mask.shape[-1] != self.output_dim:
+            raise ValueError(f"Expected state_loss_mask dim {self.output_dim}, got {mask.shape[-1]}.")
+        return mask.reshape(1, self.output_dim)
 
     def _masked_square_loss(self, pred, target, mask):
         diff = pred - target

@@ -8,6 +8,7 @@ checkpoint: ../outputs_wm_dynamics/run_20260622_100149/best.pt
 pointcloud_file:
 hybrid_rollout_feedback_mode:
 hybrid_gripper_pointcloud_mode:
+hybrid_rigidformer_predict_objects:
 output: ../eval_outputs/isaaclab_gt_vs_wm.mp4
 
 # Episode selection from the dataset.

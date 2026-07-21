@@ -101,6 +101,33 @@ def test_rollout_dataset_pairs_pointcloud_frames(tmp_path):
     assert torch.allclose(item["pc_first_robot_q_abs"], item["pc_first_robot_q_obs"])
 
 
+def test_rollout_dataset_can_supervise_cube_and_gripper_pointclouds(tmp_path):
+    state_path = tmp_path / "state.hdf5"
+    pc_path = tmp_path / "pc.hdf5"
+    _write_state_hdf5(state_path)
+    _write_pointcloud_hdf5(pc_path)
+    layout = make_robot_object_state_layout(
+        robot_dof=9,
+        action_dim=8,
+        torque_dim=9,
+        state_prediction_mode="full",
+    )
+
+    dataset = RobotObjectWMRolloutDataset(
+        [(str(state_path), "demo_0")],
+        history_len=2,
+        rollout_horizon=2,
+        dt=0.02,
+        layout=layout,
+        pointcloud_file=str(pc_path),
+        pointcloud_max_points=4,
+        pointcloud_loss_object_mode="cube_gripper",
+    )
+
+    item = dataset[0]
+    assert item["pc_loss_object_mask"].tolist() == [True, True]
+
+
 def test_pose_from_cube_points_recovers_translation_and_rotation():
     local = torch.tensor(
         [

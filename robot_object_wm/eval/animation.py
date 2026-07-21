@@ -93,6 +93,7 @@ def render_checkpoint_animation(
     target: str = "gripper",
     cube_size: float = 0.04,
     show_trails: bool = True,
+    show_gt: bool = True,
     show_gt_future: bool = True,
     show_collision_info: bool = True,
     collision_group: str = "privileged_collision",
@@ -119,6 +120,8 @@ def render_checkpoint_animation(
     )
     fk = FrankaForwardKinematics(robot_dof=cfg.robot_dof, tool_z_offset=cfg.tool_z_offset).to(torch_device)
     fk.eval()
+    show_gt = bool(show_gt)
+    show_gt_future = bool(show_gt and show_gt_future)
     collision_overlay = (
         load_collision_overlay(
             collision_dataset_file or dataset_file,
@@ -127,7 +130,7 @@ def render_checkpoint_animation(
             group_name=collision_group,
             fallback_dataset_file=dataset_file,
         )
-        if show_collision_info
+        if show_gt and show_collision_info
         else None
     )
     normalized_mode = str(render_mode).strip().lower()
@@ -160,6 +163,8 @@ def render_checkpoint_animation(
                 device=torch_device,
                 pointcloud_render_max_points=pointcloud_render_max_points,
             )
+            if not show_gt:
+                gt_pointclouds = None
         return render_rollout_comparison_animation(
             episode=episode,
             rollout=rollout,
@@ -169,11 +174,13 @@ def render_checkpoint_animation(
             fps=fps,
             cube_size=cube_size,
             show_trails=show_trails,
+            show_gt=show_gt,
             target=target,
             collision_overlay=collision_overlay,
             gt_pointclouds=gt_pointclouds,
             pred_pointclouds=pred_pointclouds,
             pointcloud_lens=pointcloud_lens,
+            show_gt_future=show_gt_future,
         )
 
     pred_target_per_t, pred_object_per_t = precompute_prediction_trajectories(
@@ -198,6 +205,7 @@ def render_checkpoint_animation(
         pred_object_per_t=pred_object_per_t,
         pred_horizon=pred_horizon,
         target=target,
+        show_gt=show_gt,
         show_gt_future=show_gt_future,
         collision_overlay=collision_overlay,
     )
@@ -220,6 +228,7 @@ def render_dataset_animation(
     max_frames: int = 0,
     cube_size: float = 0.04,
     show_trails: bool = True,
+    show_gt: bool = True,
     show_gt_future: bool = True,
     show_collision_info: bool = True,
     collision_group: str = "privileged_collision",
@@ -241,6 +250,8 @@ def render_dataset_animation(
     )
     fk = FrankaForwardKinematics(robot_dof=robot_dof, tool_z_offset=tool_z_offset).to(torch_device)
     fk.eval()
+    show_gt = bool(show_gt)
+    show_gt_future = bool(show_gt and show_gt_future)
     collision_overlay = (
         load_collision_overlay(
             collision_dataset_file or dataset_file,
@@ -249,7 +260,7 @@ def render_dataset_animation(
             group_name=collision_group,
             fallback_dataset_file=dataset_file,
         )
-        if show_collision_info
+        if show_gt and show_collision_info
         else None
     )
     return render_animation(
@@ -260,6 +271,7 @@ def render_dataset_animation(
         fps=fps,
         cube_size=cube_size,
         show_trails=show_trails,
+        show_gt=show_gt,
         show_gt_future=show_gt_future,
         collision_overlay=collision_overlay,
     )
@@ -457,11 +469,13 @@ def render_rollout_comparison_animation(
     fps: int = 25,
     cube_size: float = 0.04,
     show_trails: bool = True,
+    show_gt: bool = True,
     target: str = "gripper",
     collision_overlay: CollisionOverlay | None = None,
     gt_pointclouds: np.ndarray | None = None,
     pred_pointclouds: np.ndarray | None = None,
     pointcloud_lens: np.ndarray | None = None,
+    show_gt_future: bool = True,
 ) -> str:
     """Render one open-loop rollout against the GT episode.
 
@@ -471,6 +485,11 @@ def render_rollout_comparison_animation(
 
     if rollout.steps <= 0:
         raise ValueError(f"Rollout produced no frames: {rollout.failure_reason or 'unknown failure'}")
+    show_gt = bool(show_gt)
+    show_gt_future = bool(show_gt and show_gt_future)
+    if not show_gt:
+        gt_pointclouds = None
+        collision_overlay = None
 
     layout = episode.state_layout
     start_t = int(rollout.start_t)
@@ -509,6 +528,8 @@ def render_rollout_comparison_animation(
         "object_position_rmse_m": float(np.sqrt(np.mean(object_error**2))),
         "object_position_error_final_m": float(object_error[-1]),
         "object_position_error_max_m": float(np.max(object_error)),
+        "show_gt": bool(show_gt),
+        "show_gt_future": bool(show_gt_future),
     }
     if gt_pointclouds is not None:
         metrics["pointcloud_overlay_points_per_object"] = (
@@ -546,12 +567,11 @@ def render_rollout_comparison_animation(
     fig = plt.figure(figsize=(11, 9))
     ax = fig.add_subplot(111, projection="3d")
     bounds_points = [
-        gt_joints.reshape(-1, 3),
         pred_joints.reshape(-1, 3),
-        gt_object_pos,
         pred_object_pos,
-        episode.object_pos,
     ]
+    if show_gt:
+        bounds_points.extend([gt_joints.reshape(-1, 3), gt_object_pos, episode.object_pos])
     if gt_pointclouds is not None:
         bounds_points.append(_flatten_valid_pointclouds(gt_pointclouds, pointcloud_lens))
     if pred_pointclouds is not None:
@@ -566,20 +586,32 @@ def render_rollout_comparison_animation(
     ax.grid(True, alpha=0.2)
     ax.view_init(elev=20.0, azim=-60.0)
 
-    ax.plot(
-        episode.object_pos[:, 0],
-        episode.object_pos[:, 1],
-        episode.object_pos[:, 2],
-        color="tab:green",
-        linestyle=":",
-        linewidth=1.2,
-        alpha=0.35,
-        label="Full GT object path",
-    )
+    if show_gt_future:
+        ax.plot(
+            episode.object_pos[:, 0],
+            episode.object_pos[:, 1],
+            episode.object_pos[:, 2],
+            color="tab:green",
+            linestyle=":",
+            linewidth=1.2,
+            alpha=0.35,
+            label="Full GT object path",
+        )
 
-    gt_joint_scatter, gt_links = _make_robot_artists(ax, gt_joints[0], color="tab:blue", label="GT robot")
+    gt_joint_scatter = None
+    gt_links: list = []
+    gt_cube_lines: list = []
+    if show_gt:
+        gt_joint_scatter, gt_links = _make_robot_artists(ax, gt_joints[0], color="tab:blue", label="GT robot")
+        gt_cube_lines = _make_cube_artists(
+            ax,
+            gt_object_pos[0],
+            gt_object_quat[0],
+            cube_size,
+            color="tab:green",
+            label="GT cube",
+        )
     pred_joint_scatter, pred_links = _make_robot_artists(ax, pred_joints[0], color="tab:orange", label="Pred robot")
-    gt_cube_lines = _make_cube_artists(ax, gt_object_pos[0], gt_object_quat[0], cube_size, color="tab:green", label="GT cube")
     pred_cube_lines = _make_cube_artists(
         ax,
         pred_object_pos[0],
@@ -593,50 +625,53 @@ def render_rollout_comparison_animation(
     nan_coord = np.asarray([np.nan], dtype=np.float32)
     nan_xyz = (nan_coord, nan_coord, nan_coord)
     pointcloud_artists = _make_pointcloud_artists(ax, gt_pointclouds, pred_pointclouds, pointcloud_lens)
-    contact_marker = ax.scatter(
-        [np.nan],
-        [np.nan],
-        [np.nan],
-        s=240,
-        marker="*",
-        c="tab:red",
-        edgecolors="black",
-        linewidths=0.8,
-        depthshade=False,
-        label="GT collision",
-        zorder=8,
-    )
-    collision_points_a = ax.scatter(
-        [np.nan],
-        [np.nan],
-        [np.nan],
-        s=70,
-        marker="o",
-        c="tab:cyan",
-        edgecolors="black",
-        linewidths=0.5,
-        depthshade=False,
-        label="collision point A",
-        zorder=9,
-    )
-    collision_points_b = ax.scatter(
-        [np.nan],
-        [np.nan],
-        [np.nan],
-        s=70,
-        marker="X",
-        c="tab:purple",
-        edgecolors="black",
-        linewidths=0.5,
-        depthshade=False,
-        label="collision point B",
-        zorder=9,
-    )
+    contact_marker = collision_points_a = collision_points_b = None
+    if show_gt and collision_overlay is not None:
+        contact_marker = ax.scatter(
+            [np.nan],
+            [np.nan],
+            [np.nan],
+            s=240,
+            marker="*",
+            c="tab:red",
+            edgecolors="black",
+            linewidths=0.8,
+            depthshade=False,
+            label="GT collision",
+            zorder=8,
+        )
+        collision_points_a = ax.scatter(
+            [np.nan],
+            [np.nan],
+            [np.nan],
+            s=70,
+            marker="o",
+            c="tab:cyan",
+            edgecolors="black",
+            linewidths=0.5,
+            depthshade=False,
+            label="collision point A",
+            zorder=9,
+        )
+        collision_points_b = ax.scatter(
+            [np.nan],
+            [np.nan],
+            [np.nan],
+            s=70,
+            marker="X",
+            c="tab:purple",
+            edgecolors="black",
+            linewidths=0.5,
+            depthshade=False,
+            label="collision point B",
+            zorder=9,
+        )
 
     gt_gripper_trail = gt_cube_trail = pred_gripper_trail = pred_cube_trail = None
     if show_trails:
-        gt_gripper_trail = ax.plot([], [], [], color="tab:blue", linewidth=1.0, alpha=0.55)[0]
-        gt_cube_trail = ax.plot([], [], [], color="tab:green", linewidth=1.0, alpha=0.55)[0]
+        if show_gt:
+            gt_gripper_trail = ax.plot([], [], [], color="tab:blue", linewidth=1.0, alpha=0.55)[0]
+            gt_cube_trail = ax.plot([], [], [], color="tab:green", linewidth=1.0, alpha=0.55)[0]
         pred_gripper_trail = ax.plot([], [], [], color="tab:orange", linewidth=1.0, alpha=0.75)[0]
         pred_cube_trail = ax.plot([], [], [], color="tab:purple", linewidth=1.0, alpha=0.75)[0]
 
@@ -649,14 +684,16 @@ def render_rollout_comparison_animation(
         fontsize=10,
         bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "0.75", "boxstyle": "round,pad=0.35"},
     )
-    collision_text = ax.text2D(
-        0.02,
-        0.82,
-        "",
-        transform=ax.transAxes,
-        fontsize=9,
-        bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "0.75", "boxstyle": "round,pad=0.25"},
-    )
+    collision_text = None
+    if show_gt and collision_overlay is not None:
+        collision_text = ax.text2D(
+            0.02,
+            0.82,
+            "",
+            transform=ax.transAxes,
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "0.75", "boxstyle": "round,pad=0.25"},
+        )
     ax.set_title(f"Open-loop rollout comparison | Episode '{episode.name}'")
     ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
 
@@ -664,9 +701,11 @@ def render_rollout_comparison_animation(
         gt_frame = int(frame_indices[local_frame])
         contact_summary = _collision_summary(collision_overlay, gt_frame)
 
-        _update_robot_artists(gt_joint_scatter, gt_links, gt_joints[local_frame], color="tab:blue")
+        if show_gt and gt_joint_scatter is not None:
+            _update_robot_artists(gt_joint_scatter, gt_links, gt_joints[local_frame], color="tab:blue")
         _update_robot_artists(pred_joint_scatter, pred_links, pred_joints[local_frame], color="tab:orange")
-        _update_cube_artists(gt_cube_lines, gt_object_pos[local_frame], gt_object_quat[local_frame], cube_size, color="tab:green")
+        if show_gt:
+            _update_cube_artists(gt_cube_lines, gt_object_pos[local_frame], gt_object_quat[local_frame], cube_size, color="tab:green")
         pred_cube_color = "tab:red" if object_error[local_frame] == np.max(object_error[: local_frame + 1]) else "tab:purple"
         _update_cube_artists(
             pred_cube_lines,
@@ -676,34 +715,36 @@ def render_rollout_comparison_animation(
             color=pred_cube_color,
         )
 
-        if contact_summary["active"]:
+        if contact_marker is not None and contact_summary["active"]:
             contact_marker._offsets3d = (
                 gt_object_pos[local_frame : local_frame + 1, 0],
                 gt_object_pos[local_frame : local_frame + 1, 1],
                 gt_object_pos[local_frame : local_frame + 1, 2],
             )
-        else:
+        elif contact_marker is not None:
             contact_marker._offsets3d = nan_xyz
-        points_a, points_b = _collision_points_for_frame(collision_overlay, gt_frame)
-        collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2]) if points_a.size else nan_xyz
-        collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2]) if points_b.size else nan_xyz
+        if collision_points_a is not None and collision_points_b is not None:
+            points_a, points_b = _collision_points_for_frame(collision_overlay, gt_frame)
+            collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2]) if points_a.size else nan_xyz
+            collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2]) if points_b.size else nan_xyz
         for artist, sequence, object_idx in pointcloud_artists:
             points = _pointcloud_points_for_frame(sequence, pointcloud_lens, local_frame, object_idx)
             artist._offsets3d = (points[:, 0], points[:, 1], points[:, 2]) if points.size else nan_xyz
 
         if show_trails:
-            assert gt_gripper_trail is not None and gt_cube_trail is not None
             assert pred_gripper_trail is not None and pred_cube_trail is not None
-            gt_gripper_trail.set_data_3d(
-                gt_joints[: local_frame + 1, -1, 0],
-                gt_joints[: local_frame + 1, -1, 1],
-                gt_joints[: local_frame + 1, -1, 2],
-            )
-            gt_cube_trail.set_data_3d(
-                gt_object_pos[: local_frame + 1, 0],
-                gt_object_pos[: local_frame + 1, 1],
-                gt_object_pos[: local_frame + 1, 2],
-            )
+            if show_gt:
+                assert gt_gripper_trail is not None and gt_cube_trail is not None
+                gt_gripper_trail.set_data_3d(
+                    gt_joints[: local_frame + 1, -1, 0],
+                    gt_joints[: local_frame + 1, -1, 1],
+                    gt_joints[: local_frame + 1, -1, 2],
+                )
+                gt_cube_trail.set_data_3d(
+                    gt_object_pos[: local_frame + 1, 0],
+                    gt_object_pos[: local_frame + 1, 1],
+                    gt_object_pos[: local_frame + 1, 2],
+                )
             pred_gripper_trail.set_data_3d(
                 pred_joints[: local_frame + 1, -1, 0],
                 pred_joints[: local_frame + 1, -1, 1],
@@ -724,7 +765,8 @@ def render_rollout_comparison_animation(
             f"{target} RMSE={metrics[f'{target}_position_rmse_m']:.4f} m  "
             f"object RMSE={metrics['object_position_rmse_m']:.4f} m"
         )
-        collision_text.set_text(contact_summary["text"])
+        if collision_text is not None:
+            collision_text.set_text(contact_summary["text"])
         return ()
 
     anim = FuncAnimation(fig, update, frames=rollout.steps, interval=1000.0 / max(1, fps), blit=False)
@@ -759,9 +801,14 @@ def render_animation(
     pred_object_per_t: list[np.ndarray | None] | None = None,
     pred_horizon: int = 10,
     target: str = "gripper",
+    show_gt: bool = True,
     show_gt_future: bool = True,
     collision_overlay: CollisionOverlay | None = None,
 ) -> str:
+    show_gt = bool(show_gt)
+    show_gt_future = bool(show_gt and show_gt_future)
+    if not show_gt:
+        collision_overlay = None
     joints_3d = compute_joint_positions(episode.joint_pos_abs, fk, device)
     object_pos = episode.object_pos
     object_quat = episode.object_quat
@@ -794,112 +841,119 @@ def render_animation(
     ax.view_init(elev=20.0, azim=-60.0)
 
     joint_xyz = joints_3d[0]
-    joint_scatter = ax.scatter(
-        joint_xyz[:, 0],
-        joint_xyz[:, 1],
-        joint_xyz[:, 2],
-        s=180,
-        c="tab:blue",
-        edgecolors="black",
-        linewidths=0.8,
-        depthshade=True,
-        zorder=5,
-    )
+    joint_scatter = None
+    if show_gt:
+        joint_scatter = ax.scatter(
+            joint_xyz[:, 0],
+            joint_xyz[:, 1],
+            joint_xyz[:, 2],
+            s=180,
+            c="tab:blue",
+            edgecolors="black",
+            linewidths=0.8,
+            depthshade=True,
+            zorder=5,
+        )
     link_lines = []
-    for idx in range(joint_xyz.shape[0] - 1):
-        line = ax.plot(
-            [joint_xyz[idx, 0], joint_xyz[idx + 1, 0]],
-            [joint_xyz[idx, 1], joint_xyz[idx + 1, 1]],
-            [joint_xyz[idx, 2], joint_xyz[idx + 1, 2]],
-            color="black",
-            linewidth=3.0,
-            solid_capstyle="round",
-            zorder=4,
-        )[0]
-        link_lines.append(line)
+    if show_gt:
+        for idx in range(joint_xyz.shape[0] - 1):
+            line = ax.plot(
+                [joint_xyz[idx, 0], joint_xyz[idx + 1, 0]],
+                [joint_xyz[idx, 1], joint_xyz[idx + 1, 1]],
+                [joint_xyz[idx, 2], joint_xyz[idx + 1, 2]],
+                color="black",
+                linewidth=3.0,
+                solid_capstyle="round",
+                zorder=4,
+            )[0]
+            link_lines.append(line)
 
     corners0 = cube_corners(object_pos[0], object_quat[0], cube_size)
     cube_lines = []
-    for edge in _CUBE_EDGES:
-        i, j = int(edge[0]), int(edge[1])
-        cube_lines.append(
-            ax.plot(
-                [corners0[i, 0], corners0[j, 0]],
-                [corners0[i, 1], corners0[j, 1]],
-                [corners0[i, 2], corners0[j, 2]],
-                color="tab:red",
-                linewidth=2.0,
-                zorder=3,
-            )[0]
+    if show_gt:
+        for edge in _CUBE_EDGES:
+            i, j = int(edge[0]), int(edge[1])
+            cube_lines.append(
+                ax.plot(
+                    [corners0[i, 0], corners0[j, 0]],
+                    [corners0[i, 1], corners0[j, 1]],
+                    [corners0[i, 2], corners0[j, 2]],
+                    color="tab:red",
+                    linewidth=2.0,
+                    zorder=3,
+                )[0]
+            )
+
+    contact_marker = collision_points_a = collision_points_b = None
+    if show_gt and collision_overlay is not None:
+        contact_marker = ax.scatter(
+            [np.nan],
+            [np.nan],
+            [np.nan],
+            s=260,
+            marker="*",
+            c="tab:orange",
+            edgecolors="black",
+            linewidths=0.8,
+            depthshade=False,
+            label="Active collision",
+            zorder=7,
+        )
+        collision_points_a = ax.scatter(
+            [np.nan],
+            [np.nan],
+            [np.nan],
+            s=80,
+            marker="o",
+            c="tab:cyan",
+            edgecolors="black",
+            linewidths=0.6,
+            depthshade=False,
+            label="Collision point A",
+            zorder=8,
+        )
+        collision_points_b = ax.scatter(
+            [np.nan],
+            [np.nan],
+            [np.nan],
+            s=80,
+            marker="X",
+            c="tab:purple",
+            edgecolors="black",
+            linewidths=0.6,
+            depthshade=False,
+            label="Collision point B",
+            zorder=8,
         )
 
-    contact_marker = ax.scatter(
-        [np.nan],
-        [np.nan],
-        [np.nan],
-        s=260,
-        marker="*",
-        c="tab:orange",
-        edgecolors="black",
-        linewidths=0.8,
-        depthshade=False,
-        label="Active collision",
-        zorder=7,
-    )
-    collision_points_a = ax.scatter(
-        [np.nan],
-        [np.nan],
-        [np.nan],
-        s=80,
-        marker="o",
-        c="tab:cyan",
-        edgecolors="black",
-        linewidths=0.6,
-        depthshade=False,
-        label="Collision point A",
-        zorder=8,
-    )
-    collision_points_b = ax.scatter(
-        [np.nan],
-        [np.nan],
-        [np.nan],
-        s=80,
-        marker="X",
-        c="tab:purple",
-        edgecolors="black",
-        linewidths=0.6,
-        depthshade=False,
-        label="Collision point B",
-        zorder=8,
-    )
-
     gripper_trail = cube_trail = None
-    if show_trails:
+    if show_gt and show_trails:
         gripper_trail = ax.plot([], [], [], color="tab:blue", linewidth=1.0, alpha=0.55, zorder=2)[0]
         cube_trail = ax.plot([], [], [], color="tab:red", linewidth=1.0, alpha=0.55, zorder=2)[0]
 
-    ax.plot(
-        target_pos[:, 0],
-        target_pos[:, 1],
-        target_pos[:, 2],
-        color="tab:cyan",
-        linestyle=":",
-        linewidth=1.4,
-        alpha=0.45,
-        label=f"Dataset {target} path",
-        zorder=1.5,
-    )
-    ax.plot(
-        object_pos[:, 0],
-        object_pos[:, 1],
-        object_pos[:, 2],
-        color="tab:green",
-        linestyle=":",
-        linewidth=1.4,
-        alpha=0.45,
-        label="Dataset object path",
-        zorder=1.5,
-    )
+    if show_gt_future:
+        ax.plot(
+            target_pos[:, 0],
+            target_pos[:, 1],
+            target_pos[:, 2],
+            color="tab:cyan",
+            linestyle=":",
+            linewidth=1.4,
+            alpha=0.45,
+            label=f"Dataset {target} path",
+            zorder=1.5,
+        )
+        ax.plot(
+            object_pos[:, 0],
+            object_pos[:, 1],
+            object_pos[:, 2],
+            color="tab:green",
+            linestyle=":",
+            linewidth=1.4,
+            alpha=0.45,
+            label="Dataset object path",
+            zorder=1.5,
+        )
 
     nan_coord = np.asarray([np.nan], dtype=np.float32)
     nan_xyz = (nan_coord, nan_coord, nan_coord)
@@ -938,60 +992,64 @@ def render_animation(
     ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
 
     time_text = ax.text2D(0.02, 0.96, "", transform=ax.transAxes, fontsize=12)
-    collision_text = ax.text2D(
-        0.02,
-        0.90,
-        "",
-        transform=ax.transAxes,
-        fontsize=10,
-        color="black",
-        bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "0.75", "boxstyle": "round,pad=0.35"},
-    )
+    collision_text = None
+    if show_gt and collision_overlay is not None:
+        collision_text = ax.text2D(
+            0.02,
+            0.90,
+            "",
+            transform=ax.transAxes,
+            fontsize=10,
+            color="black",
+            bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "0.75", "boxstyle": "round,pad=0.35"},
+        )
     ax.set_title(f"Episode '{episode.name}'")
 
     def update(frame: int):
         contact_summary = _collision_summary(collision_overlay, frame)
         cube_color = _cube_collision_color(contact_summary)
         cube_width = 3.2 if contact_summary["active"] else 2.0
-        joint_scatter._offsets3d = (
-            joints_3d[frame, :, 0],
-            joints_3d[frame, :, 1],
-            joints_3d[frame, :, 2],
-        )
-        for idx, line in enumerate(link_lines):
-            line.set_color("tab:orange" if contact_summary["gripper_active"] and idx >= len(link_lines) - 2 else "black")
-            line.set_data_3d(
-                [joints_3d[frame, idx, 0], joints_3d[frame, idx + 1, 0]],
-                [joints_3d[frame, idx, 1], joints_3d[frame, idx + 1, 1]],
-                [joints_3d[frame, idx, 2], joints_3d[frame, idx + 1, 2]],
+        if show_gt and joint_scatter is not None:
+            joint_scatter._offsets3d = (
+                joints_3d[frame, :, 0],
+                joints_3d[frame, :, 1],
+                joints_3d[frame, :, 2],
             )
-        corners = cube_corners(object_pos[frame], object_quat[frame], cube_size)
-        for line, edge in zip(cube_lines, _CUBE_EDGES):
-            i, j = int(edge[0]), int(edge[1])
-            line.set_color(cube_color)
-            line.set_linewidth(cube_width)
-            line.set_data_3d(
-                [corners[i, 0], corners[j, 0]],
-                [corners[i, 1], corners[j, 1]],
-                [corners[i, 2], corners[j, 2]],
-            )
-        if contact_summary["active"]:
+            for idx, line in enumerate(link_lines):
+                line.set_color("tab:orange" if contact_summary["gripper_active"] and idx >= len(link_lines) - 2 else "black")
+                line.set_data_3d(
+                    [joints_3d[frame, idx, 0], joints_3d[frame, idx + 1, 0]],
+                    [joints_3d[frame, idx, 1], joints_3d[frame, idx + 1, 1]],
+                    [joints_3d[frame, idx, 2], joints_3d[frame, idx + 1, 2]],
+                )
+            corners = cube_corners(object_pos[frame], object_quat[frame], cube_size)
+            for line, edge in zip(cube_lines, _CUBE_EDGES):
+                i, j = int(edge[0]), int(edge[1])
+                line.set_color(cube_color)
+                line.set_linewidth(cube_width)
+                line.set_data_3d(
+                    [corners[i, 0], corners[j, 0]],
+                    [corners[i, 1], corners[j, 1]],
+                    [corners[i, 2], corners[j, 2]],
+                )
+        if contact_marker is not None and contact_summary["active"]:
             contact_marker._offsets3d = (
                 object_pos[frame : frame + 1, 0],
                 object_pos[frame : frame + 1, 1],
                 object_pos[frame : frame + 1, 2],
             )
-        else:
+        elif contact_marker is not None:
             contact_marker._offsets3d = nan_xyz
-        points_a, points_b = _collision_points_for_frame(collision_overlay, frame)
-        if points_a.size > 0:
-            collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2])
-        else:
-            collision_points_a._offsets3d = nan_xyz
-        if points_b.size > 0:
-            collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2])
-        else:
-            collision_points_b._offsets3d = nan_xyz
+        if collision_points_a is not None and collision_points_b is not None:
+            points_a, points_b = _collision_points_for_frame(collision_overlay, frame)
+            if points_a.size > 0:
+                collision_points_a._offsets3d = (points_a[:, 0], points_a[:, 1], points_a[:, 2])
+            else:
+                collision_points_a._offsets3d = nan_xyz
+            if points_b.size > 0:
+                collision_points_b._offsets3d = (points_b[:, 0], points_b[:, 1], points_b[:, 2])
+            else:
+                collision_points_b._offsets3d = nan_xyz
         if gripper_trail is not None and cube_trail is not None:
             gripper_trail.set_data_3d(joints_3d[: frame + 1, -1, 0], joints_3d[: frame + 1, -1, 1], joints_3d[: frame + 1, -1, 2])
             cube_trail.set_data_3d(object_pos[: frame + 1, 0], object_pos[: frame + 1, 1], object_pos[: frame + 1, 2])
@@ -1014,7 +1072,8 @@ def render_animation(
                 gt_target_line.set_data_3d(*nan_xyz)
                 gt_object_line.set_data_3d(*nan_xyz)
         time_text.set_text(f"t = {frame * episode.dt:.2f} s   step {frame + 1}/{T}")
-        collision_text.set_text(contact_summary["text"])
+        if collision_text is not None:
+            collision_text.set_text(contact_summary["text"])
         return ()
 
     anim = FuncAnimation(fig, update, frames=T, interval=1000.0 / max(1, fps), blit=False)
@@ -1397,10 +1456,36 @@ def _cube_collision_color(summary: dict[str, object]) -> str:
     return "tab:red"
 
 
+def find_latest_checkpoint(output_dir: str | Path) -> str:
+    """Find latest.pt, or this project's equivalent last.pt, in the newest run."""
+    root = Path(output_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"World-model output directory not found: {root}")
+
+    candidates: list[Path] = []
+    for run_dir in root.glob("run_*"):
+        if not run_dir.is_dir():
+            continue
+        checkpoint = run_dir / "latest.pt"
+        if not checkpoint.is_file():
+            checkpoint = run_dir / "last.pt"
+        if checkpoint.is_file():
+            candidates.append(checkpoint)
+
+    if not candidates:
+        raise FileNotFoundError(f"No run_*/latest.pt or run_*/last.pt checkpoint found under {root}")
+    return str(max(candidates, key=lambda path: path.stat().st_mtime))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render WMDynamics dataset/prediction animation.")
     parser.add_argument("--dataset_file", type=str, default="./dataset/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5")
-    parser.add_argument("--checkpoint", type=str, default="./outputs_wm_dynamics/run_20260622_100149/best.pt")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint path. If omitted, select latest.pt/last.pt from the newest run_* directory.",
+    )
     parser.add_argument("--pointcloud_file", type=str, default=None)
     parser.add_argument(
         "--pointcloud_render_max_points",
@@ -1444,20 +1529,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--cube_size", type=float, default=0.04)
     parser.add_argument("--no_trails", dest="show_trails", action="store_false", default=True)
-    parser.add_argument("--no_gt_future", dest="show_gt_future", action="store_false", default=False)
+    parser.add_argument("--gt", dest="show_gt", action="store_true")
+    parser.add_argument("--no_gt", dest="show_gt", action="store_false")
+    parser.add_argument("--gt_future", dest="show_gt_future", action="store_true")
+    parser.add_argument("--no_gt_future", dest="show_gt_future", action="store_false")
+    parser.set_defaults(show_gt=True)
+    parser.set_defaults(show_gt_future=True)
     collision = parser.add_argument_group("collision overlay")
     collision.add_argument("--collision_info", dest="show_collision_info", action="store_true", default=True)
     collision.add_argument("--no_collision_info", dest="show_collision_info", action="store_false")
     collision.add_argument("--collision_group", type=str, default="privileged_collision")
     collision.add_argument("--collision_dataset_file", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.show_gt:
+        args.show_gt_future = False
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.checkpoint is None:
+        output_dir = Path(__file__).resolve().parents[1] / "outputs_wm_dynamics"
+        args.checkpoint = find_latest_checkpoint(output_dir)
+        print(f"Auto-selected checkpoint: {args.checkpoint}")
     if args.checkpoint:
         loaded = load_checkpoint_model(args.checkpoint, device=args.device)
+        checkpoint_name = Path(args.checkpoint).resolve().parent.name
+        episode_id = args.episode_name if args.episode_name is not None else args.episode_index
+        output_path = str(Path(args.output).parent / f"{checkpoint_name}_{episode_id}.mp4")
         if args.pointcloud_file is not None:
             loaded.config.pointcloud_file = os.path.abspath(args.pointcloud_file)
             if hasattr(loaded.model, "pointcloud_file"):
@@ -1474,7 +1574,7 @@ def main(argv: list[str] | None = None) -> None:
             model=loaded.model,
             cfg=loaded.config,
             dataset_file=args.dataset_file,
-            output_path=args.output,
+            output_path=output_path,
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             pred_horizon=args.pred_horizon,
@@ -1487,6 +1587,7 @@ def main(argv: list[str] | None = None) -> None:
             target=args.target,
             cube_size=args.cube_size,
             show_trails=args.show_trails,
+            show_gt=args.show_gt,
             show_gt_future=args.show_gt_future,
             show_collision_info=args.show_collision_info,
             collision_group=args.collision_group,
@@ -1497,7 +1598,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         written = render_dataset_animation(
             dataset_file=args.dataset_file,
-            output_path=args.output,
+            output_path=f"{args.output}_{args.episode_index}.mp4" if args.episode_name is None else f"{args.output}_{args.episode_name}.mp4",
             episode_index=args.episode_index,
             episode_name=args.episode_name,
             robot_dof=args.robot_dof,
@@ -1511,6 +1612,7 @@ def main(argv: list[str] | None = None) -> None:
             max_frames=args.max_frames,
             cube_size=args.cube_size,
             show_trails=args.show_trails,
+            show_gt=args.show_gt,
             show_gt_future=args.show_gt_future,
             show_collision_info=args.show_collision_info,
             collision_group=args.collision_group,

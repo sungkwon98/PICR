@@ -16,3 +16,7 @@ avp_dim: 128
 paper_pointnet_level_dim: 256
 pos_loss_weight: 10.0
 acc_loss_weight: 1.0
+# Clip nearest-neighbor displacement feature magnitude in meters.
+# null keeps original RigidFormer behavior. Clipping avoids OOD huge-gap features
+# without making far objects look like contact.
+nearest_neighbor_max_dist: 0.5

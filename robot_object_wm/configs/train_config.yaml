@@ -1,7 +1,7 @@
 # Default TrainConfig for robot-object RWM training.
 
 dataset_dir: ../../rigidformer/data/franka
-dataset_file: ../dataset/Franka_Lift_policy_free_cube_drop_states_only_100hz_11003ep_collision_augmented.hdf5
+dataset_file: ../../rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5
 
 # split: robot DeLaN + object MLP
 # whole: one DeLaN over robot + object generalized coordinates
@@ -9,13 +9,21 @@ dataset_file: ../dataset/Franka_Lift_policy_free_cube_drop_states_only_100hz_110
 # rwm: RWMEnsemble dynamics model configured by rwm_config.yaml
 model_type: hybrid
 rwm_config: rwm_config.yaml
-pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_policy_free_cube_drop_meshfk_posecube_1024p_100hz_11003ep.hdf5
+pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p_11003ep.hdf5
 rigidformer_config: hybrid_rigidformer_config.yaml
 hybrid_robot_model_type: rwm
-hybrid_rollout_feedback_mode: rigidformer_pose # robot_native or rigidformer_pose 
-hybrid_gripper_pointcloud_mode: predicted_fk # gt or predicted_fk
+hybrid_robot_output_mode: robot_only # full_masked or robot_only
+hybrid_rollout_feedback_mode: robot_native # robot_native or rigidformer_pose
+hybrid_gripper_pointcloud_mode: gt # gt or predicted_fk
+hybrid_rigidformer_predict_objects: cube_gripper # cube or cube_gripper
 robot_loss_weight: 1.0
 rigidformer_loss_weight: 1.0
+hybrid_gripper_consistency_loss_weight: .1 # 0 disables robot-FK vs RF-gripper consistency
+hybrid_gripper_consistency_gradient_mode: both # robot, rigidformer, or both
+# Hybrid training schedule. Robot-only updates are cheap, while RigidFormer
+# point-cloud updates are expensive. Defaults reproduce the original behavior.
+hybrid_robot_updates_per_batch: 1
+hybrid_rigidformer_update_every: 1
 
 delan_use_history : false
 
@@ -37,7 +45,7 @@ torque_key: applied_torque
 # 1: collision flag
 # 2: signed distance
 # 3: signed distance + nearest points
-privileged_collision_observation: 0
+privileged_collision_observation: 3
 privileged_collision_group: privileged_collision
 privileged_collision_pairs: object_ground,object_left_finger,object_right_finger,object_gripper
 privileged_collision_loss_weight: 1.0
@@ -49,7 +57,7 @@ tool_z_offset: 0.1034
 dt: 0.01
 ode_solver: euler  # euler or rk4
 
-batch_size: 64
+batch_size: 256
 epochs: 200
 lr: 1.0e-4
 weight_decay: 1.0e-6
@@ -89,6 +97,8 @@ log_every_batches: 200
 train_batch_fraction: 1.
 train_subsample_fraction: 1.
 val_subsample_fraction: .1
+# Validate every N epochs. 1 = every epoch, 0 = final epoch only.
+val_every: 1
 
 filter_pre_contact: false
 object_displacement_threshold: 0.005
@@ -99,7 +109,7 @@ subtract_env_origin: true
 
 wandb_project_name: world-model
 wandb_entity: tjrcjf410-seoul-national-university
-wandb_name: franka_drop_hybrid_rwm_obj_posecube_1024p_100hz
+wandb_name:
 wandb_mode: online
 wandb_artifacts: true
 
@@ -108,7 +118,7 @@ wandb_artifacts: true
 eval_after_train: true
 eval_fail_on_error: false
 # 0 disables periodic rendering. Positive values render/log every N epochs.
-render_every: 0
+render_every: 5
 eval_output_dir: eval
 eval_split: val
 eval_batch_size:

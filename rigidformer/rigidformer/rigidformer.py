@@ -59,7 +59,8 @@ def l1norm(t):
 def nearest_neighbor_displacement(
     object_pos,     # (b no n 3)
     mask = None,    # (b no n)
-    ground_z = 0.
+    ground_z = 0.,
+    max_dist = None
 ):
     """for each vertex, displacement vector to the closest point on another object or the ground plane"""
 
@@ -103,7 +104,16 @@ def nearest_neighbor_displacement(
     # use ground displacement where ground was closest
 
     is_ground = other_idx == total_points
-    return einx.where('b no n, b no n p, b no n p -> b no n p', is_ground, ground_disp, other_disp)
+    disp = einx.where('b no n, b no n p, b no n p -> b no n p', is_ground, ground_disp, other_disp)
+
+    if exists(max_dist):
+        max_dist = torch.as_tensor(max_dist, device = disp.device, dtype = disp.dtype)
+        if max_dist.item() > 0.:
+            eps = torch.finfo(disp.dtype).eps
+            disp_norm = disp.norm(dim = -1, keepdim = True).clamp_min(eps)
+            disp = disp * (max_dist / disp_norm).clamp(max = 1.)
+
+    return disp
 
 # naive fps
 
@@ -681,12 +691,16 @@ class Rigidformer(Module):
         paper_architecture = False,
         vertex_feature_dim = None,
         avp_dim = 256,
-        paper_pointnet_level_dim = 1024
+        paper_pointnet_level_dim = 1024,
+        nearest_neighbor_max_dist = None
     ):
         super().__init__()
 
         self.paper_architecture = paper_architecture
         self.vertex_properties_dim = vertex_properties_dim
+        self.nearest_neighbor_max_dist = None if not exists(nearest_neighbor_max_dist) else float(nearest_neighbor_max_dist)
+        if exists(self.nearest_neighbor_max_dist) and self.nearest_neighbor_max_dist <= 0.:
+            self.nearest_neighbor_max_dist = None
         vertex_feature_dim = default(vertex_feature_dim, 1024 if paper_architecture else dim)
 
         if paper_architecture and vertex_properties_dim != 3:
@@ -899,7 +913,11 @@ class Rigidformer(Module):
 
         # nearest neighbor displacement to other object or ground plane - section 3.1 of paper
 
-        nearest_neighbor_disp = nearest_neighbor_displacement(object_pos, mask = combined_mask)
+        nearest_neighbor_disp = nearest_neighbor_displacement(
+            object_pos,
+            mask = combined_mask,
+            max_dist = self.nearest_neighbor_max_dist
+        )
 
         vertex_features = cat((nearest_neighbor_disp, velocity, reference_offset, vertex_properties), dim = -1)
         vertex_tokens = self.vertex_encoder(vertex_features)

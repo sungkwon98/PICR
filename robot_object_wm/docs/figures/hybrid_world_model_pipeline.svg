@@ -1,0 +1,231 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
+  <title id="title">Hybrid Robot World Model with RigidFormer Object Dynamics</title>
+  <desc id="desc">Pipeline diagram for offline hybrid training and online imaginary rollout using RGB-D object point clouds, FK gripper point clouds, robot dynamics, and RigidFormer point-cloud dynamics.</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#b45309"/>
+    </marker>
+    <marker id="arrow-gray" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#475569"/>
+    </marker>
+    <filter id="soft-shadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .page { fill: #ffffff; }
+      .title { font: 700 34px Helvetica, Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 18px Helvetica, Arial, sans-serif; fill: #475569; }
+      .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.8; rx: 20; }
+      .panel-title { font: 700 25px Helvetica, Arial, sans-serif; fill: #0f172a; }
+      .panel-subtitle { font: 400 15px Helvetica, Arial, sans-serif; fill: #64748b; }
+      .box { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.7; rx: 14; filter: url(#soft-shadow); }
+      .box-blue { fill: #eff6ff; stroke: #60a5fa; }
+      .box-green { fill: #ecfdf5; stroke: #34d399; }
+      .box-amber { fill: #fffbeb; stroke: #f59e0b; }
+      .box-purple { fill: #f5f3ff; stroke: #a78bfa; }
+      .box-red { fill: #fff1f2; stroke: #fb7185; }
+      .box-gray { fill: #f8fafc; stroke: #94a3b8; }
+      .step { font: 700 16px Helvetica, Arial, sans-serif; letter-spacing: 0.4px; fill: #64748b; }
+      .head { font: 700 18px Helvetica, Arial, sans-serif; fill: #0f172a; }
+      .small-head { font: 700 15px Helvetica, Arial, sans-serif; fill: #0f172a; }
+      .text { font: 400 14px Helvetica, Arial, sans-serif; fill: #334155; }
+      .tiny { font: 400 12px Helvetica, Arial, sans-serif; fill: #475569; }
+      .code { font: 600 12px Menlo, Consolas, monospace; fill: #334155; }
+      .loss { font: 700 14px Helvetica, Arial, sans-serif; fill: #881337; }
+      .arrow-blue { fill: none; stroke: #2563eb; stroke-width: 3; marker-end: url(#arrow-blue); }
+      .arrow-green { fill: none; stroke: #15803d; stroke-width: 3; marker-end: url(#arrow-green); }
+      .arrow-amber { fill: none; stroke: #b45309; stroke-width: 3; marker-end: url(#arrow-amber); }
+      .arrow-gray { fill: none; stroke: #475569; stroke-width: 2.4; marker-end: url(#arrow-gray); }
+      .arrow-dash { stroke-dasharray: 9 7; }
+      .label-blue { fill: #dbeafe; stroke: #60a5fa; }
+      .label-green { fill: #dcfce7; stroke: #34d399; }
+      .label-amber { fill: #fef3c7; stroke: #f59e0b; }
+      .label-gray { fill: #f1f5f9; stroke: #cbd5e1; }
+      .chip-text { font: 700 12px Menlo, Consolas, monospace; fill: #0f172a; }
+      .divider { stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 8 8; }
+      .loop { fill: none; stroke: #475569; stroke-width: 2.5; stroke-dasharray: 10 8; marker-end: url(#arrow-gray); }
+    </style>
+  </defs>
+
+  <rect class="page" x="0" y="0" width="1800" height="1120"/>
+
+  <text class="title" x="70" y="65">Hybrid Robot World Model with RigidFormer Object Dynamics</text>
+  <text class="subtitle" x="70" y="96">State-space Franka prediction is coupled with point-cloud object prediction for long-horizon imaginary rollout.</text>
+
+  <rect class="panel" x="55" y="130" width="760" height="910"/>
+  <text class="panel-title" x="90" y="178">A. Offline hybrid learning</text>
+  <text class="panel-subtitle" x="90" y="204">Paired state HDF5 and mesh/FK point-cloud HDF5, aligned by episode name.</text>
+
+  <rect class="panel" x="855" y="130" width="890" height="910"/>
+  <text class="panel-title" x="890" y="178">B. Online imaginary rollout</text>
+  <text class="panel-subtitle" x="890" y="204">At deployment, object point clouds come from multi-view RGB-D; gripper point clouds come from FK.</text>
+
+  <!-- Offline data sources -->
+  <rect class="box box-blue" x="95" y="245" width="285" height="130"/>
+  <text class="step" x="120" y="278">STATE DATA</text>
+  <text class="head" x="120" y="304">Robot-object state HDF5</text>
+  <text class="text" x="120" y="330">history states s(t-H:t)</text>
+  <text class="text" x="120" y="351">actions / torques tau(t:t+K)</text>
+  <text class="text" x="120" y="372">future robot targets q,dq</text>
+
+  <rect class="box box-green" x="465" y="245" width="285" height="130"/>
+  <text class="step" x="490" y="278">POINT-CLOUD DATA</text>
+  <text class="head" x="490" y="304">Mesh/FK HDF5</text>
+  <text class="text" x="490" y="330">cube + gripper point clouds</text>
+  <text class="text" x="490" y="351">P(t-1), P(t), P(t+1)</text>
+  <text class="text" x="490" y="372">history-2, one-step stride 1</text>
+
+  <rect class="box box-blue" x="95" y="465" width="285" height="150"/>
+  <text class="step" x="120" y="498">ROBOT MODEL</text>
+  <text class="head" x="120" y="524">RWM or DeLaN backend</text>
+  <text class="text" x="120" y="550">predicts Franka motion</text>
+  <text class="code" x="120" y="575">robot_only: q,dq head</text>
+  <text class="code" x="120" y="596">full_masked: full state head</text>
+
+  <rect class="box box-green" x="465" y="465" width="285" height="150"/>
+  <text class="step" x="490" y="498">OBJECT MODEL</text>
+  <text class="head" x="490" y="524">RigidFormer dynamics</text>
+  <text class="text" x="490" y="550">input: cube history + gripper context</text>
+  <text class="text" x="490" y="571">output: next cube point cloud</text>
+  <text class="code" x="490" y="596">cube or cube_gripper loss</text>
+
+  <rect class="box box-red" x="95" y="705" width="285" height="115"/>
+  <text class="step" x="120" y="737">ROBOT LOSS</text>
+  <text class="loss" x="120" y="766">state rollout loss on q,dq</text>
+  <text class="text" x="120" y="790">object channels are not the robot target</text>
+
+  <rect class="box box-red" x="465" y="705" width="285" height="115"/>
+  <text class="step" x="490" y="737">POINT-CLOUD LOSS</text>
+  <text class="loss" x="490" y="766">one-step RF loss on P(t+1)</text>
+  <text class="text" x="490" y="790">uses GT cube + gripper point clouds</text>
+
+  <rect class="box box-gray" x="155" y="895" width="535" height="95"/>
+  <text class="head" x="185" y="928">Training objective</text>
+  <text class="text" x="185" y="955">L = w_robot L_robot + w_RF L_RigidFormer</text>
+  <text class="text" x="185" y="976">The two losses are independent; RF does not consume predicted robot states during training.</text>
+
+  <path class="arrow-blue" d="M 238 375 L 238 452"/>
+  <path class="arrow-green" d="M 608 375 L 608 452"/>
+  <path class="arrow-blue" d="M 238 615 L 238 692"/>
+  <path class="arrow-green" d="M 608 615 L 608 692"/>
+  <path class="arrow-gray" d="M 238 820 C 245 865 310 887 370 895"/>
+  <path class="arrow-gray" d="M 608 820 C 600 865 535 887 475 895"/>
+  <path class="arrow-gray arrow-dash" d="M 380 310 C 420 310 425 310 465 310"/>
+  <text class="tiny" x="385" y="294">episode_names</text>
+
+  <!-- Online observation and initialization -->
+  <rect class="box box-green" x="900" y="245" width="245" height="118"/>
+  <text class="step" x="925" y="276">PERCEPTION</text>
+  <text class="head" x="925" y="302">Multi-view RGB-D</text>
+  <text class="text" x="925" y="328">fuse + segment object</text>
+  <text class="code" x="925" y="350">P_cube(t)</text>
+
+  <rect class="box box-blue" x="1220" y="245" width="245" height="118"/>
+  <text class="step" x="1245" y="276">ROBOT STATE</text>
+  <text class="head" x="1245" y="302">Encoders + command</text>
+  <text class="text" x="1245" y="328">q(t), dq(t), tau(t)</text>
+  <text class="code" x="1245" y="350">s_robot(t)</text>
+
+  <rect class="box box-amber" x="1500" y="245" width="205" height="118"/>
+  <text class="step" x="1522" y="276">GRIPPER PC</text>
+  <text class="head" x="1522" y="302">Forward kinematics</text>
+  <text class="text" x="1522" y="328">robot body mesh -> points</text>
+  <text class="code" x="1522" y="350">predicted_fk</text>
+
+  <rect class="box box-gray" x="1020" y="430" width="565" height="120"/>
+  <text class="step" x="1050" y="463">ROLLOUT MEMORY</text>
+  <text class="head" x="1050" y="489">Hybrid history buffer</text>
+  <text class="text" x="1050" y="515">full state history s(t-H:t), cube point history P_cube(t-1:t)</text>
+  <text class="text" x="1050" y="536">gripper point history P_gripper(t-1:t)</text>
+
+  <path class="arrow-green" d="M 1022 363 L 1125 424"/>
+  <path class="arrow-blue" d="M 1342 363 L 1342 424"/>
+  <path class="arrow-amber" d="M 1545 363 C 1510 400 1480 415 1435 430"/>
+  <path class="arrow-blue" d="M 1465 304 L 1488 304"/>
+
+  <!-- Online rollout core -->
+  <rect class="box box-blue" x="900" y="640" width="295" height="150"/>
+  <text class="step" x="930" y="672">ROBOT DYNAMICS</text>
+  <text class="head" x="930" y="699">f_robot(s, tau)</text>
+  <text class="text" x="930" y="725">RWM or DeLaN predicts</text>
+  <text class="code" x="930" y="750">q(t+1), dq(t+1)</text>
+  <text class="tiny" x="930" y="773">current setting: robot_only RWM head</text>
+
+  <rect class="box box-green" x="1265" y="640" width="295" height="150"/>
+  <text class="step" x="1295" y="672">POINT-CLOUD DYNAMICS</text>
+  <text class="head" x="1295" y="699">RigidFormer</text>
+  <text class="text" x="1295" y="725">uses cube history and gripper context</text>
+  <text class="code" x="1295" y="750">P_cube(t+1)</text>
+  <text class="tiny" x="1295" y="773">one-step model iterated for horizon K</text>
+
+  <rect class="box box-amber" x="1060" y="855" width="255" height="120"/>
+  <text class="step" x="1090" y="886">FK UPDATE</text>
+  <text class="head" x="1090" y="912">Predicted gripper PC</text>
+  <text class="text" x="1090" y="938">q(t+1) -> gripper mesh points</text>
+  <text class="code" x="1090" y="960">P_gripper(t+1)</text>
+
+  <rect class="box box-purple" x="1395" y="855" width="285" height="120"/>
+  <text class="step" x="1425" y="886">POSE READOUT</text>
+  <text class="head" x="1425" y="912">Kabsch alignment</text>
+  <text class="text" x="1425" y="938">next cube PC -> SE(3) pose</text>
+  <text class="code" x="1425" y="960">object_pos, object_quat, vel</text>
+
+  <rect class="box box-gray" x="1055" y="1010" width="535" height="80"/>
+  <text class="head" x="1085" y="1042">Compose next full state s(t+1)</text>
+  <text class="text" x="1085" y="1067">robot q,dq from robot model + cube pose/velocity from RigidFormer</text>
+
+  <path class="arrow-blue" d="M 1195 715 L 1252 715"/>
+  <path class="arrow-blue" d="M 1048 790 L 1135 842"/>
+  <path class="arrow-amber" d="M 1315 915 L 1378 915"/>
+  <path class="arrow-green" d="M 1412 790 L 1515 842"/>
+  <path class="arrow-blue" d="M 1188 975 L 1208 1001"/>
+  <path class="arrow-green" d="M 1538 975 L 1505 1001"/>
+
+  <path class="arrow-blue" d="M 1185 550 C 1088 585 1048 600 1048 627"/>
+  <path class="arrow-green" d="M 1415 550 C 1415 585 1415 600 1415 627"/>
+  <path class="arrow-amber" d="M 1498 550 C 1395 585 1378 605 1430 640"/>
+
+  <!-- Feedback policy callout -->
+  <rect class="box box-gray" x="1210" y="565" width="445" height="45"/>
+  <text class="code" x="1235" y="593">hybrid_gripper_pointcloud_mode = predicted_fk</text>
+
+  <rect class="box box-gray" x="900" y="835" width="135" height="120"/>
+  <text class="small-head" x="922" y="866">Action plan</text>
+  <text class="code" x="922" y="892">tau(t+1)</text>
+  <text class="code" x="922" y="914">tau(t+2)</text>
+  <text class="code" x="922" y="936">...</text>
+  <path class="arrow-gray" d="M 967 835 L 995 792"/>
+
+  <rect class="box box-purple" x="900" y="470" width="90" height="55"/>
+  <text class="small-head" x="923" y="502">loop</text>
+  <text class="tiny" x="913" y="520">k=1...K</text>
+
+  <path class="loop" d="M 1322 1090 C 1725 1090 1725 470 1587 470"/>
+  <text class="tiny" x="1390" y="1000">append predictions to history, then repeat</text>
+
+  <!-- Feedback mode switch -->
+  <rect class="box box-gray" x="1600" y="640" width="120" height="150"/>
+  <text class="small-head" x="1620" y="670">Feedback</text>
+  <text class="code" x="1620" y="699">robot_native</text>
+  <text class="tiny" x="1620" y="718">robot input uses</text>
+  <text class="tiny" x="1620" y="735">native state</text>
+  <text class="code" x="1620" y="760">rigidformer_pose</text>
+  <text class="tiny" x="1620" y="779">insert RF pose</text>
+  <path class="arrow-gray arrow-dash" d="M 1560 715 L 1588 715"/>
+
+  <!-- Chips -->
+  <rect class="label-blue" x="95" y="222" width="92" height="24" rx="12"/>
+  <text class="chip-text" x="111" y="238">state</text>
+  <rect class="label-green" x="465" y="222" width="108" height="24" rx="12"/>
+  <text class="chip-text" x="481" y="238">pointcloud</text>
+  <rect class="label-amber" x="1500" y="222" width="92" height="24" rx="12"/>
+  <text class="chip-text" x="1516" y="238">FK mesh</text>
+  <rect class="label-gray" x="70" y="1048" width="585" height="34" rx="17"/>
+  <text class="code" x="90" y="1070">Training RF gripper context: GT mesh/FK. Online rollout gripper context: predicted_fk from robot q.</text>
+</svg>

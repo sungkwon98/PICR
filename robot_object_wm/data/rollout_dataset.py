@@ -24,10 +24,33 @@ from .hdf5_schema import (
 )
 
 RobotObjectWMStateLayout = RobotObjectStateLayout
+POINTCLOUD_LOSS_OBJECT_MODES = ("hdf5", "cube", "cube_gripper")
 
 
 def _decode_hdf5_strings(values) -> list[str]:
     return [value.decode("utf-8") if isinstance(value, bytes) else str(value) for value in values]
+
+
+def normalize_pointcloud_loss_object_mode(value: str | None) -> str:
+    normalized = "hdf5" if value in (None, "") else str(value).strip().lower()
+    if normalized not in POINTCLOUD_LOSS_OBJECT_MODES:
+        raise ValueError(
+            f"pointcloud loss object mode must be one of {POINTCLOUD_LOSS_OBJECT_MODES}; got {value!r}."
+        )
+    return normalized
+
+
+def pointcloud_loss_object_mask_for_mode(mask: np.ndarray, mode: str) -> np.ndarray:
+    mode = normalize_pointcloud_loss_object_mode(mode)
+    out = np.asarray(mask, dtype=bool).copy()
+    if mode == "hdf5":
+        return out
+    out[...] = False
+    if out.shape[0] > 0:
+        out[0] = True
+    if mode == "cube_gripper" and out.shape[0] > 1:
+        out[1] = True
+    return out
 
 
 def _allocate_counts(total: int, weights: np.ndarray) -> np.ndarray:
@@ -184,6 +207,8 @@ class RobotObjectWMRolloutDataset(Dataset):
         privileged_collision_pairs: str | None = None,
         pointcloud_file: str | None = None,
         pointcloud_max_points: int | None = None,
+        lazy_pointcloud: bool = False,
+        pointcloud_loss_object_mode: str | None = "hdf5",
     ) -> None:
         super().__init__()
         if history_len < 1:
@@ -200,6 +225,8 @@ class RobotObjectWMRolloutDataset(Dataset):
         self.subtract_env_origin = subtract_env_origin
         self.pointcloud_file = None if pointcloud_file in (None, "") else str(pointcloud_file)
         self.pointcloud_max_points = int(pointcloud_max_points) if pointcloud_max_points is not None else None
+        self.lazy_pointcloud = bool(lazy_pointcloud)
+        self.pointcloud_loss_object_mode = normalize_pointcloud_loss_object_mode(pointcloud_loss_object_mode)
         self._pointcloud_h5 = None
         self._pointcloud_episode_to_index: dict[str, int] = {}
         self._pointcloud_steps = 0
@@ -329,10 +356,11 @@ class RobotObjectWMRolloutDataset(Dataset):
             mask = np.ones((self._pointcloud_num_objects,), dtype=bool)
             if self._pointcloud_num_objects > 1:
                 mask[1:] = False
-            return mask
+            return pointcloud_loss_object_mask_for_mode(mask, self.pointcloud_loss_object_mode)
         dataset = data["loss_object_mask"]
         mask = np.asarray(dataset if dataset.ndim == 1 else dataset[episode_index], dtype=bool)
-        return mask[: self._pointcloud_num_objects]
+        mask = mask[: self._pointcloud_num_objects]
+        return pointcloud_loss_object_mask_for_mode(mask, self.pointcloud_loss_object_mode)
 
     def _load_pointcloud_window(self, episode_index: int, frame_index: int) -> dict[str, torch.Tensor]:
         start = int(frame_index) - 1
@@ -612,8 +640,30 @@ class RobotObjectWMRolloutDataset(Dataset):
     def __len__(self) -> int:
         return int(self.history_states.shape[0])
 
+    def load_pointcloud_item(self, idx: int) -> dict[str, torch.Tensor]:
+        if self.pointcloud_file is None:
+            raise RuntimeError("pointcloud_file is not configured.")
+        episode_index, frame_index = self.pointcloud_indices[int(idx)]
+        item = self._load_pointcloud_window(int(episode_index), int(frame_index))
+        item["pc_first_object_pos_w"] = torch.from_numpy(self.pointcloud_first_object_pos_w[int(idx)])
+        item["pc_first_object_quat"] = torch.from_numpy(self.pointcloud_first_object_quat[int(idx)])
+        item["pc_env_origin"] = torch.from_numpy(self.pointcloud_env_origin[int(idx)])
+        item["pc_first_robot_q_abs"] = torch.from_numpy(self.pointcloud_first_robot_q_abs[int(idx)])
+        item["pc_first_robot_q_obs"] = torch.from_numpy(self.pointcloud_first_robot_q_obs[int(idx)])
+        return item
+
+    def load_pointcloud_batch(self, indices) -> dict[str, torch.Tensor]:
+        samples = [self.load_pointcloud_item(int(index)) for index in indices]
+        if not samples:
+            return {}
+        return {
+            key: torch.stack([sample[key] for sample in samples], dim=0)
+            for key in samples[0]
+        }
+
     def __getitem__(self, idx: int):
         item = {
+            "sample_index": torch.tensor(int(idx), dtype=torch.long),
             "history_states": torch.from_numpy(self.history_states[idx]),
             "history_actions": torch.from_numpy(self.history_actions[idx]),
             "history_torques": torch.from_numpy(self.history_torques[idx]),
@@ -623,12 +673,6 @@ class RobotObjectWMRolloutDataset(Dataset):
             "object_context": torch.from_numpy(self.object_context[idx]),
             "contact_t_in_window": int(self.contact_t_in_window[idx]),
         }
-        if self.pointcloud_file is not None:
-            episode_index, frame_index = self.pointcloud_indices[idx]
-            item.update(self._load_pointcloud_window(int(episode_index), int(frame_index)))
-            item["pc_first_object_pos_w"] = torch.from_numpy(self.pointcloud_first_object_pos_w[idx])
-            item["pc_first_object_quat"] = torch.from_numpy(self.pointcloud_first_object_quat[idx])
-            item["pc_env_origin"] = torch.from_numpy(self.pointcloud_env_origin[idx])
-            item["pc_first_robot_q_abs"] = torch.from_numpy(self.pointcloud_first_robot_q_abs[idx])
-            item["pc_first_robot_q_obs"] = torch.from_numpy(self.pointcloud_first_robot_q_obs[idx])
+        if self.pointcloud_file is not None and not self.lazy_pointcloud:
+            item.update(self.load_pointcloud_item(int(idx)))
         return item

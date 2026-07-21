@@ -28,16 +28,33 @@ model_type: hybrid
 pointcloud_file: ../../rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p_11003ep.hdf5
 rigidformer_config: hybrid_rigidformer_config.yaml
 hybrid_robot_model_type: rwm        # rwm or delan
+hybrid_robot_output_mode: robot_only  # full_masked or robot_only
 hybrid_rollout_feedback_mode: robot_native  # robot_native or rigidformer_pose
 hybrid_gripper_pointcloud_mode: gt  # gt or predicted_fk
+hybrid_rigidformer_predict_objects: cube_gripper  # cube or cube_gripper
 robot_loss_weight: 1.0
 rigidformer_loss_weight: 1.0
+hybrid_gripper_consistency_loss_weight: 1.0  # 0 disables RF-gripper/FK-gripper robot loss
+hybrid_gripper_consistency_gradient_mode: both  # robot, rigidformer, or both
+hybrid_robot_updates_per_batch: 1
+hybrid_rigidformer_update_every: 1
 render_every: 0
 eval_isaaclab_video: false
 eval_isaaclab_config: isaaclab_visualization.yaml
 ```
 
-RigidFormer architecture defaults are in `configs/hybrid_rigidformer_config.yaml`.
+RigidFormer architecture defaults are in `configs/hybrid_rigidformer_config.yaml`:
+
+```yaml
+nearest_neighbor_max_dist: 0.5  # meters; null restores original unbounded RF feature
+```
+
+RigidFormer uses nearest-displacement vectors from each point to the closest other object point or ground plane. We clip the vector norm instead of zeroing far neighbors because a zero displacement is ambiguous with contact.
+
+Robot output modes:
+
+- `full_masked`: old behavior. The hybrid RWM robot backend predicts the full state vector, but the robot loss mask trains only Franka `q` and `dq`.
+- `robot_only`: the hybrid RWM robot backend output head is physically smaller and predicts only Franka `q` and, in full-state mode, `dq`. Object pose/velocity channels are not produced by the robot head. During hybrid rollout, the partial robot prediction is composed back into a normal full state vector; `rigidformer_pose` then inserts the RF object pose before the next robot step.
 
 Rollout feedback modes:
 
@@ -49,6 +66,18 @@ Gripper point-cloud modes:
 - `gt`: RigidFormer context gripper points are teacher-forced from the mesh/FK HDF5 trajectory.
 - `predicted_fk`: the frame-0 gripper point cloud is converted back to canonical hand/finger points, then forward kinematics regenerates rollout gripper points from predicted Franka `q`. This uses the state-dataset q offset because `obs/joint_pos` is reset-relative while the mesh/FK file was generated from absolute `states/articulation/robot/joint_position`.
 
+RigidFormer predicted objects:
+
+- `cube`: supervise/predict cube dynamics only; gripper remains context.
+- `cube_gripper`: supervise both cube and gripper point clouds by changing the RF loss mask to `[True, True]`. For RF-predicted gripper rollouts, keep `hybrid_gripper_pointcloud_mode: gt`; `predicted_fk` intentionally overrides the gripper points with FK-generated points.
+
+Robot gripper consistency loss:
+
+- `hybrid_gripper_consistency_loss_weight > 0` adds a pose-space auxiliary loss for `cube_gripper` training. The robot model predicts `q(t+1)`, differentiable FK converts it to gripper pose/orientation, and the one-step RigidFormer gripper point-cloud prediction is converted back to gripper pose/orientation with Kabsch on the rigid hand points.
+- The regular `cube_gripper` RigidFormer loss is still supervised from the ground-truth next gripper point cloud in the HDF5. The consistency term compares the two model predictions in pose space.
+- `hybrid_gripper_consistency_gradient_mode` controls which model receives consistency gradients: `robot`, `rigidformer`, or `both`.
+- Set `hybrid_gripper_consistency_loss_weight: 0.0` to disable it.
+
 ## Training
 
 Run from the repository root:
@@ -58,6 +87,7 @@ Run from the repository root:
   --config robot_object_wm/configs/train_config.yaml \
   --model_type hybrid \
   --hybrid_robot_model_type rwm \
+  --hybrid_robot_output_mode robot_only \
   --dataset_file rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5 \
   --pointcloud_file rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p_11003ep.hdf5
 ```
@@ -69,6 +99,7 @@ Small smoke run:
   --config robot_object_wm/configs/train_config.yaml \
   --model_type hybrid \
   --hybrid_robot_model_type rwm \
+  --hybrid_robot_output_mode robot_only \
   --dataset_file rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5 \
   --pointcloud_file rigidformer/data/franka/Franka_Lift_meshfk_posecube_1024p_11003ep.hdf5 \
   --epochs 1 \
@@ -79,6 +110,38 @@ Small smoke run:
   --eval_after_train false
 ```
 
+Train the robot backend more often than RigidFormer:
+
+```bash
+/home/sukchul/miniconda3/envs/rigidformer/bin/python -m robot_object_wm.training.train \
+  --config robot_object_wm/configs/train_config.yaml \
+  --hybrid_robot_updates_per_batch 2 \
+  --hybrid_rigidformer_update_every 4
+```
+
+This keeps robot loss active on every batch, adds one extra robot-only optimizer step, and updates the point-cloud RigidFormer loss every fourth batch. Validation still evaluates both losses normally.
+When `hybrid_rigidformer_update_every > 1`, training loads point-cloud tensors lazily only on RigidFormer update batches; robot-only batches use only the state dataset.
+
+To avoid full validation every epoch:
+
+```bash
+/home/sukchul/miniconda3/envs/rigidformer/bin/python -m robot_object_wm.training.train \
+  --config robot_object_wm/configs/train_config.yaml \
+  --val_every 5
+```
+
+`val_every: 0` skips periodic validation and validates only on the final epoch. `last.pt` is still saved every epoch; `best.pt` updates only on validation epochs.
+
+Train RigidFormer on both cube and gripper:
+
+```bash
+/home/sukchul/miniconda3/envs/rigidformer/bin/python -m robot_object_wm.training.train \
+  --config robot_object_wm/configs/train_config.yaml \
+  --hybrid_rigidformer_predict_objects cube_gripper \
+  --hybrid_gripper_consistency_loss_weight 1.0 \
+  --hybrid_gripper_consistency_gradient_mode both
+```
+
 For DeLaN robot dynamics, use full state:
 
 ```bash
@@ -86,6 +149,7 @@ For DeLaN robot dynamics, use full state:
   --config robot_object_wm/configs/train_config.yaml \
   --model_type hybrid \
   --hybrid_robot_model_type delan \
+  --hybrid_robot_output_mode full_masked \
   --state_prediction_mode full \
   --privileged_collision_observation 0 \
   --dataset_file rigidformer/data/franka/Lift_RL_opt_robot_object_dynamics_joint_params_rand_context_11003ep_no_slip_trimmed_collision_augmented.hdf5 \

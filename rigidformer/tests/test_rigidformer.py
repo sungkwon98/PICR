@@ -3,6 +3,20 @@ import torch
 import pytest
 param = pytest.mark.parametrize
 
+
+def test_nearest_neighbor_displacement_clips_far_distances():
+    from rigidformer.rigidformer import nearest_neighbor_displacement
+
+    object_pos = torch.tensor([[[[0., 0., 10.]], [[2., 0., 10.]]]])
+
+    raw = nearest_neighbor_displacement(object_pos)
+    clipped = nearest_neighbor_displacement(object_pos, max_dist = 0.5)
+
+    assert torch.allclose(raw[0, 0, 0], torch.tensor([2., 0., 0.]))
+    assert torch.allclose(raw[0, 1, 0], torch.tensor([-2., 0., 0.]))
+    assert torch.allclose(clipped[0, 0, 0], torch.tensor([0.5, 0., 0.]))
+    assert torch.allclose(clipped[0, 1, 0], torch.tensor([-0.5, 0., 0.]))
+
 @param('fps', (False, True))
 @param('test_rand_steps', (False, True))
 @param('attn_residual_learned_pooling', (False, True))

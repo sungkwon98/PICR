@@ -134,6 +134,12 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> TrainConfig:
     saved = dict(checkpoint.get("config", {}))
     if "state_prediction_mode" not in saved:
         saved["state_prediction_mode"] = "full"
+    if "hybrid_robot_output_mode" not in saved:
+        saved["hybrid_robot_output_mode"] = "full_masked"
+    if "hybrid_gripper_consistency_loss_weight" not in saved:
+        saved["hybrid_gripper_consistency_loss_weight"] = 0.0
+    if "hybrid_gripper_consistency_gradient_mode" not in saved:
+        saved["hybrid_gripper_consistency_gradient_mode"] = "robot"
     defaults = asdict(parse_args([]))
     legacy_aliases = {
         "object_mlp_hidden_dim": "object_hidden_dim",
@@ -433,6 +439,7 @@ def _build_eval_dataset(cfg: TrainConfig, refs: list[Any], rigidformer_cfg: Rigi
             {
                 "pointcloud_file": cfg.pointcloud_file,
                 "pointcloud_max_points": rigidformer_cfg.max_points,
+                "pointcloud_loss_object_mode": cfg.hybrid_rigidformer_predict_objects,
             }
         )
     dataset = rollout_dataset.RobotObjectWMRolloutDataset(**dataset_kwargs)
@@ -578,6 +585,11 @@ def parse_eval_args(argv: list[str] | None = None):
         choices=("gt", "predicted_fk"),
         default=None,
     )
+    parser.add_argument(
+        "--hybrid_rigidformer_predict_objects",
+        choices=("cube", "cube_gripper"),
+        default=None,
+    )
 
     episode = parser.add_argument_group("single episode rollout plot")
     episode.add_argument("--episode_plot", action="store_true", default=False)
@@ -634,6 +646,10 @@ def main(argv: list[str] | None = None) -> dict[str, str]:
         loaded.config.hybrid_gripper_pointcloud_mode = args.hybrid_gripper_pointcloud_mode
         if hasattr(loaded.model, "gripper_pointcloud_mode"):
             loaded.model.gripper_pointcloud_mode = args.hybrid_gripper_pointcloud_mode
+    if args.hybrid_rigidformer_predict_objects is not None:
+        loaded.config.hybrid_rigidformer_predict_objects = args.hybrid_rigidformer_predict_objects
+        if hasattr(loaded.model, "rigidformer_predict_objects"):
+            loaded.model.rigidformer_predict_objects = args.hybrid_rigidformer_predict_objects
     loader, meta = make_eval_loader(
         loaded.config,
         rigidformer_cfg=loaded.rigidformer_config,

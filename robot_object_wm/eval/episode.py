@@ -106,6 +106,7 @@ def load_episode_pointcloud_data(
     episode_name: str,
     *,
     max_points: int,
+    loss_object_mode: str = "hdf5",
 ) -> EpisodePointCloudData:
     if not pointcloud_file or not os.path.isfile(pointcloud_file):
         raise FileNotFoundError(f"Pointcloud file not found: {pointcloud_file}")
@@ -141,6 +142,10 @@ def load_episode_pointcloud_data(
             loss_object_mask = np.ones((object_points.shape[1],), dtype=bool)
             if object_points.shape[1] > 1:
                 loss_object_mask[1:] = False
+        loss_object_mask = rollout_dataset.pointcloud_loss_object_mask_for_mode(
+            loss_object_mask[: object_points.shape[1]],
+            loss_object_mode,
+        )
         object_point_lens = np.full((object_points.shape[1],), point_count, dtype=np.int64)
         if "object_point_counts" in data:
             counts = np.asarray(data["object_point_counts"][episode_index, :, : object_points.shape[1]], dtype=np.int64)
@@ -160,7 +165,7 @@ def load_episode_pointcloud_data(
         object_points=object_points,
         vertex_properties=vertex_properties[: object_points.shape[1]].astype(np.float32),
         object_point_lens=object_point_lens,
-        loss_object_mask=loss_object_mask[: object_points.shape[1]],
+        loss_object_mask=loss_object_mask,
         gripper_part_ids=gripper_part_ids,
         control_dt=control_dt,
     )
@@ -172,8 +177,10 @@ def _cached_episode_pointcloud_data(
     episode_name: str,
     *,
     max_points: int,
+    loss_object_mode: str = "hdf5",
 ) -> EpisodePointCloudData:
-    key = (os.path.abspath(pointcloud_file), episode_name, int(max_points))
+    loss_object_mode = rollout_dataset.normalize_pointcloud_loss_object_mode(loss_object_mode)
+    key = (os.path.abspath(pointcloud_file), episode_name, int(max_points), loss_object_mode)
     cache = getattr(model, "_hybrid_pointcloud_episode_cache", None)
     if cache is None:
         cache = OrderedDict()
@@ -183,7 +190,12 @@ def _cached_episode_pointcloud_data(
         cache[key] = value
         return value
 
-    value = load_episode_pointcloud_data(pointcloud_file, episode_name, max_points=max_points)
+    value = load_episode_pointcloud_data(
+        pointcloud_file,
+        episode_name,
+        max_points=max_points,
+        loss_object_mode=loss_object_mode,
+    )
     cache[key] = value
     while len(cache) > 16:
         cache.popitem(last=False)
@@ -459,6 +471,7 @@ def _rollout_hybrid_episode(
         pointcloud_file,
         episode.name,
         max_points=int(getattr(model, "rigidformer_max_points", 1024)),
+        loss_object_mode=getattr(model, "rigidformer_predict_objects", "cube"),
     )
     if start_t < 1:
         return _empty_rollout(

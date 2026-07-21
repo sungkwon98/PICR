@@ -33,9 +33,14 @@ from robot_object_wm.models.hybrid import (
     HybridRigidFormerWMDynamics,
     RigidFormerObjectConfig,
     build_rigidformer_object_model,
+    normalize_hybrid_gripper_consistency_gradient_mode,
     normalize_hybrid_feedback_mode,
     normalize_hybrid_gripper_pointcloud_mode,
+    normalize_hybrid_rigidformer_predict_objects,
     normalize_hybrid_robot_model_type,
+    normalize_hybrid_robot_output_mode,
+    pointcloud_tensors,
+    quat_angle_error,
     rigidformer_eval_metrics,
     rigidformer_loss,
 )
@@ -60,8 +65,11 @@ FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
 FIELD_CHOICES = {
     "model_type": ("split", "whole", "MLP", "mlp", "rwm", "hybrid"),
     "hybrid_robot_model_type": ("rwm", "delan"),
+    "hybrid_robot_output_mode": ("full_masked", "robot_only"),
     "hybrid_rollout_feedback_mode": ("robot_native", "rigidformer_pose"),
     "hybrid_gripper_pointcloud_mode": ("gt", "predicted_fk"),
+    "hybrid_rigidformer_predict_objects": ("cube", "cube_gripper"),
+    "hybrid_gripper_consistency_gradient_mode": ("robot", "rigidformer", "both"),
     "action_type": ("policy", "torque", "Torque"),
     "state_prediction_mode": ("full", "position"),
     "torque_key": ("applied_torque", "computed_torque"),
@@ -85,10 +93,16 @@ class TrainConfig:
     pointcloud_file: str | None
     rigidformer_config: str | None
     hybrid_robot_model_type: str
+    hybrid_robot_output_mode: str
     hybrid_rollout_feedback_mode: str
     hybrid_gripper_pointcloud_mode: str
+    hybrid_rigidformer_predict_objects: str
     robot_loss_weight: float
     rigidformer_loss_weight: float
+    hybrid_gripper_consistency_loss_weight: float
+    hybrid_gripper_consistency_gradient_mode: str
+    hybrid_robot_updates_per_batch: int
+    hybrid_rigidformer_update_every: int
     history_len: int
     rollout_horizon: int
     robot_dof: int
@@ -145,6 +159,7 @@ class TrainConfig:
     train_batch_fraction: float
     train_subsample_fraction: float
     val_subsample_fraction: float
+    val_every: int
     filter_pre_contact: bool
     object_displacement_threshold: float
     object_velocity_threshold: float
@@ -217,6 +232,7 @@ class RigidFormerConfig:
     paper_pointnet_level_dim: int = 256
     pos_loss_weight: float = 10.0
     acc_loss_weight: float = 1.0
+    nearest_neighbor_max_dist: float | None = None
 
     def to_model_config(self) -> RigidFormerObjectConfig:
         return RigidFormerObjectConfig(
@@ -236,6 +252,7 @@ class RigidFormerConfig:
             paper_pointnet_level_dim=self.paper_pointnet_level_dim,
             pos_loss_weight=self.pos_loss_weight,
             acc_loss_weight=self.acc_loss_weight,
+            nearest_neighbor_max_dist=self.nearest_neighbor_max_dist,
         )
 
 
@@ -347,6 +364,8 @@ def _validate_rigidformer_config(cfg: RigidFormerConfig, path: Path) -> None:
         raise ValueError(f"{path}: object_hidden_layers length must match anchor_cross_attn_depth.")
     if cfg.pos_loss_weight < 0.0 or cfg.acc_loss_weight < 0.0:
         raise ValueError(f"{path}: RigidFormer loss weights must be non-negative.")
+    if cfg.nearest_neighbor_max_dist is not None and cfg.nearest_neighbor_max_dist <= 0.0:
+        raise ValueError(f"{path}: nearest_neighbor_max_dist must be positive or null.")
 
 
 def _require_config_keys(values: dict[str, Any], path: str | Path) -> None:
@@ -545,10 +564,29 @@ def _validate_privileged_collision_model_support(cfg: TrainConfig) -> None:
         )
     if model_type == "hybrid":
         robot_type = normalize_hybrid_robot_model_type(cfg.hybrid_robot_model_type)
+        robot_output_mode = normalize_hybrid_robot_output_mode(cfg.hybrid_robot_output_mode)
         normalize_hybrid_feedback_mode(cfg.hybrid_rollout_feedback_mode)
         normalize_hybrid_gripper_pointcloud_mode(cfg.hybrid_gripper_pointcloud_mode)
+        normalize_hybrid_rigidformer_predict_objects(cfg.hybrid_rigidformer_predict_objects)
+        normalize_hybrid_gripper_consistency_gradient_mode(cfg.hybrid_gripper_consistency_gradient_mode)
+        if cfg.hybrid_robot_updates_per_batch < 1:
+            raise ValueError("hybrid_robot_updates_per_batch must be >= 1.")
+        if cfg.hybrid_rigidformer_update_every < 1:
+            raise ValueError("hybrid_rigidformer_update_every must be >= 1.")
+        if cfg.hybrid_gripper_consistency_loss_weight < 0.0:
+            raise ValueError("hybrid_gripper_consistency_loss_weight must be >= 0.")
+        if (
+            cfg.hybrid_gripper_consistency_loss_weight > 0.0
+            and normalize_hybrid_rigidformer_predict_objects(cfg.hybrid_rigidformer_predict_objects) != "cube_gripper"
+        ):
+            raise ValueError(
+                "hybrid_gripper_consistency_loss_weight > 0 requires "
+                "hybrid_rigidformer_predict_objects='cube_gripper'."
+            )
         if robot_type == "delan" and state_prediction_mode != "full":
             raise ValueError("hybrid_robot_model_type='delan' requires state_prediction_mode='full'.")
+        if robot_type == "delan" and robot_output_mode != "full_masked":
+            raise ValueError("hybrid_robot_output_mode='robot_only' is only supported with hybrid_robot_model_type='rwm'.")
         if cfg.pointcloud_file in (None, ""):
             raise ValueError("model_type='hybrid' requires pointcloud_file.")
 
@@ -614,15 +652,26 @@ def make_dataloaders(cfg: TrainConfig, rigidformer_cfg: RigidFormerConfig | None
     }
     if _normalize_model_type(cfg.model_type) == "hybrid":
         rigidformer_cfg = rigidformer_cfg or load_rigidformer_config(cfg.rigidformer_config)
+        needs_train_pointcloud_every_batch = cfg.hybrid_gripper_consistency_loss_weight > 0.0
+        lazy_train_pointcloud = (
+            not needs_train_pointcloud_every_batch
+            and (cfg.rigidformer_loss_weight <= 0.0 or cfg.hybrid_rigidformer_update_every > 1)
+        )
         dataset_kwargs.update(
             {
                 "pointcloud_file": cfg.pointcloud_file,
                 "pointcloud_max_points": rigidformer_cfg.max_points,
+                "pointcloud_loss_object_mode": cfg.hybrid_rigidformer_predict_objects,
             }
         )
+    else:
+        lazy_train_pointcloud = False
+    train_dataset_kwargs = dict(dataset_kwargs)
+    if _normalize_model_type(cfg.model_type) == "hybrid":
+        train_dataset_kwargs["lazy_pointcloud"] = lazy_train_pointcloud
     train_dataset = rollout_dataset.RobotObjectWMRolloutDataset(
         episode_refs=train_refs,
-        **dataset_kwargs,
+        **train_dataset_kwargs,
     )
     val_dataset = rollout_dataset.RobotObjectWMRolloutDataset(
         episode_refs=val_refs,
@@ -667,6 +716,8 @@ def make_dataloaders(cfg: TrainConfig, rigidformer_cfg: RigidFormerConfig | None
             {
                 "pointcloud_file": os.path.abspath(str(cfg.pointcloud_file)),
                 "pointcloud_max_points": int((rigidformer_cfg or load_rigidformer_config(cfg.rigidformer_config)).max_points),
+                "hybrid_rigidformer_predict_objects": cfg.hybrid_rigidformer_predict_objects,
+                "train_lazy_pointcloud": bool(lazy_train_pointcloud),
             }
         )
 
@@ -747,6 +798,7 @@ def build_model(
                 ensemble_size=rwm_cfg.ensemble_size,
                 history_horizon=rwm_cfg.history_horizon,
                 architecture_config=_rwm_architecture_config(rwm_cfg),
+                prediction_indices=_hybrid_robot_prediction_indices(cfg),
             )
             robot.model_type = "rwm"
             robot.action_type = _normalize_action_type(cfg.action_type)
@@ -784,6 +836,7 @@ def build_model(
             subtract_env_origin=cfg.subtract_env_origin,
             pointcloud_file=cfg.pointcloud_file,
             rigidformer_max_points=rigidformer_cfg.max_points,
+            rigidformer_predict_objects=cfg.hybrid_rigidformer_predict_objects,
         )
     if model_type in {"whole", "mlp"}:
         whole_cfg = WholeWMDynamicsConfig(
@@ -1010,6 +1063,16 @@ def _hybrid_robot_state_loss_mask(cfg: TrainConfig, device: torch.device) -> tor
     return mask
 
 
+def _hybrid_robot_prediction_indices(cfg: TrainConfig) -> list[int] | None:
+    if normalize_hybrid_robot_output_mode(cfg.hybrid_robot_output_mode) != "robot_only":
+        return None
+    layout = _state_layout(cfg)
+    indices = list(range(layout.robot_q_slice.start, layout.robot_q_slice.stop))
+    if layout.has_joint_vel:
+        indices.extend(range(layout.robot_dq_slice.start, layout.robot_dq_slice.stop))
+    return indices
+
+
 def _hybrid_rwm_robot_loss(
     model: HybridRigidFormerWMDynamics,
     batch: dict[str, Any],
@@ -1018,11 +1081,13 @@ def _hybrid_rwm_robot_loss(
     rwm_cfg: RWMConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     state_batch, action_batch, action_values = _rwm_sequence_batch(batch, device, cfg)
+    prediction_indices = getattr(model.robot, "prediction_indices", None)
+    state_loss_mask = None if prediction_indices is not None else _hybrid_robot_state_loss_mask(cfg, device)
     state_loss, sequence_loss, bound_loss, kl_loss = model.robot.compute_loss(
         state_batch,
         action_batch,
         bootstrap=rwm_cfg.bootstrap,
-        state_loss_mask=_hybrid_robot_state_loss_mask(cfg, device),
+        state_loss_mask=state_loss_mask,
     )
     loss = (
         rwm_cfg.state_loss_weight * state_loss
@@ -1030,7 +1095,7 @@ def _hybrid_rwm_robot_loss(
         + rwm_cfg.bound_loss_weight * bound_loss
         + rwm_cfg.kl_loss_weight * kl_loss
     )
-    return loss, {
+    metrics = {
         "hybrid_robot_loss": loss.detach(),
         "hybrid_rwm_state_loss": state_loss.detach(),
         "hybrid_rwm_sequence_loss": sequence_loss.detach(),
@@ -1038,6 +1103,11 @@ def _hybrid_rwm_robot_loss(
         "hybrid_rwm_kl_loss": kl_loss.detach(),
         "action_abs_mean": action_values.abs().mean().detach(),
     }
+    if prediction_indices is not None:
+        metrics["hybrid_rwm_output_dim"] = torch.tensor(int(prediction_indices.numel()), device=device)
+    else:
+        metrics["hybrid_rwm_state_loss_active_dims"] = state_loss_mask.sum().detach()
+    return loss, metrics
 
 
 def _hybrid_delan_robot_loss(
@@ -1073,6 +1143,155 @@ def _hybrid_delan_robot_loss(
     }
 
 
+def _hybrid_robot_one_step_state(
+    model: HybridRigidFormerWMDynamics,
+    batch: dict[str, Any],
+    device: torch.device,
+    cfg: TrainConfig,
+) -> torch.Tensor:
+    if model.robot_backend == "rwm":
+        state_batch, action_batch, _ = _rwm_sequence_batch(batch, device, cfg)
+        horizon = int(model.robot.history_horizon)
+        x_state = state_batch[:, :horizon]
+        x_action = action_batch[:, 1 : horizon + 1]
+        if hasattr(model.robot, "reset"):
+            model.robot.reset()
+        raw_pred, _, _ = model.robot(x_state, x_action)
+        if hasattr(model.robot, "reset"):
+            model.robot.reset()
+        return model._compose_rwm_robot_state(raw_pred, x_state[:, -1])
+
+    pred = model(
+        batch["history_states"].to(device),
+        batch["future_torques"].to(device)[:, :1],
+        history_torques=batch["history_torques"].to(device),
+        pointcloud_batch=None,
+        feedback_mode="robot_native",
+    )
+    return pred[:, 0]
+
+
+def _hybrid_gripper_consistency_loss(
+    model: HybridRigidFormerWMDynamics,
+    batch: dict[str, Any],
+    device: torch.device,
+    cfg: TrainConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    weight = float(cfg.hybrid_gripper_consistency_loss_weight)
+    if weight <= 0.0:
+        zero = next(model.parameters()).new_zeros(())
+        return zero, {}
+    if normalize_hybrid_rigidformer_predict_objects(cfg.hybrid_rigidformer_predict_objects) != "cube_gripper":
+        raise ValueError(
+            "hybrid_gripper_consistency_loss_weight > 0 requires "
+            "hybrid_rigidformer_predict_objects='cube_gripper'."
+        )
+
+    pc = pointcloud_tensors(batch, device=device)
+    if pc["object_pos"].shape[1] < 2:
+        raise ValueError("Gripper consistency loss requires cube + gripper point clouds.")
+    required = ("gripper_part_ids", "first_robot_q_abs", "first_robot_q_obs")
+    missing = [key for key in required if key not in pc]
+    if missing:
+        raise ValueError(
+            "Gripper consistency loss requires pointcloud metadata keys: " + ", ".join(missing)
+        )
+
+    robot_next_state = _hybrid_robot_one_step_state(model, batch, device, cfg)
+    canonical_gripper = model._canonical_gripper_points(pc)
+    robot_pos, robot_quat = model.gripper_pose_from_state(robot_next_state, pc)
+
+    grad_mode = normalize_hybrid_gripper_consistency_gradient_mode(cfg.hybrid_gripper_consistency_gradient_mode)
+    rf_requires_grad = grad_mode in {"rigidformer", "both"} and torch.is_grad_enabled()
+    with torch.set_grad_enabled(rf_requires_grad):
+        rf_pred = model.rigidformer(
+            delta_times=pc["delta_times"],
+            vertex_properties=pc["vertex_properties"],
+            object_pos=pc["object_pos"],
+            object_pos_prev=pc["object_pos_prev"],
+            object_first_frame_pos=pc["object_first_frame_pos"],
+            object_lens=pc["object_lens"],
+            object_point_lens=pc["object_point_lens"],
+        )
+        rf_gripper_points = rf_pred.object_pos_next[:, 1]
+        rf_pos, rf_quat = model.gripper_pose_from_points(rf_gripper_points, pc, canonical_gripper)
+
+    if grad_mode == "robot":
+        rf_pos = rf_pos.detach()
+        rf_quat = rf_quat.detach()
+    elif grad_mode == "rigidformer":
+        robot_pos = robot_pos.detach()
+        robot_quat = robot_quat.detach()
+
+    pos_loss = torch.nn.functional.mse_loss(robot_pos, rf_pos)
+    orient_loss = quat_angle_error(robot_quat, rf_quat).square().mean()
+    loss = pos_loss + orient_loss
+    weighted = loss * weight
+
+    with torch.no_grad():
+        gt_pos, gt_quat = model.gripper_pose_from_points(pc["object_pos_next"][:, 1], pc, canonical_gripper)
+        rf_gt_pos_mse = torch.nn.functional.mse_loss(rf_pos.detach(), gt_pos)
+        rf_gt_orient_rmse = quat_angle_error(rf_quat.detach(), gt_quat).square().mean().sqrt()
+
+    return weighted, {
+        "hybrid_gripper_consistency_loss": loss.detach(),
+        "hybrid_gripper_consistency_position_mse": pos_loss.detach(),
+        "hybrid_gripper_consistency_orientation_mse": orient_loss.detach(),
+        "hybrid_gripper_consistency_weighted_loss": weighted.detach(),
+        "hybrid_rf_gripper_gt_pose_position_mse": rf_gt_pos_mse.detach(),
+        "hybrid_rf_gripper_gt_pose_orientation_rmse_rad": rf_gt_orient_rmse.detach(),
+    }
+
+
+def _hybrid_robot_loss(
+    model: HybridRigidFormerWMDynamics,
+    batch: dict[str, Any],
+    device: torch.device,
+    cfg: TrainConfig,
+    rwm_cfg: RWMConfig | None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if model.robot_backend == "rwm":
+        if rwm_cfg is None:
+            raise ValueError("rwm_cfg is required for hybrid_robot_model_type='rwm'.")
+        if hasattr(model.robot, "reset"):
+            model.robot.reset()
+        base_loss, metrics = _hybrid_rwm_robot_loss(model, batch, device, cfg, rwm_cfg)
+    else:
+        base_loss, metrics = _hybrid_delan_robot_loss(model, batch, device, cfg)
+
+    consistency_loss, consistency_metrics = _hybrid_gripper_consistency_loss(model, batch, device, cfg)
+    if consistency_metrics:
+        metrics["hybrid_robot_base_loss"] = base_loss.detach()
+        metrics.update(consistency_metrics)
+        total = base_loss + consistency_loss
+        metrics["hybrid_robot_loss"] = total.detach()
+        return total, metrics
+    return base_loss, metrics
+
+
+def _should_update_hybrid_rigidformer(cfg: TrainConfig, *, is_train: bool, batch_idx: int) -> bool:
+    if not is_train:
+        return True
+    if cfg.rigidformer_loss_weight <= 0.0:
+        return False
+    return (int(batch_idx) - 1) % int(cfg.hybrid_rigidformer_update_every) == 0
+
+
+def _ensure_hybrid_pointcloud_batch(batch: dict[str, Any], loader: DataLoader) -> dict[str, Any]:
+    if "pc_object_pos" in batch:
+        return batch
+    if "sample_index" not in batch:
+        raise KeyError("Lazy hybrid point-cloud loading requires batch['sample_index'].")
+    dataset = loader.dataset
+    if not hasattr(dataset, "load_pointcloud_batch"):
+        raise TypeError("Lazy hybrid point-cloud loading requires RobotObjectWMRolloutDataset.")
+    indices = batch["sample_index"].detach().cpu().tolist()
+    pointcloud_batch = dataset.load_pointcloud_batch(indices)
+    merged = dict(batch)
+    merged.update(pointcloud_batch)
+    return merged
+
+
 def run_hybrid_epoch(
     model: HybridRigidFormerWMDynamics,
     loader: DataLoader,
@@ -1087,23 +1306,26 @@ def run_hybrid_epoch(
     averager = MetricAverager()
     num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     phase = "train" if is_train else "val"
+    robot_updates_per_batch = int(cfg.hybrid_robot_updates_per_batch) if is_train else 1
 
     for batch_idx, batch in enumerate(loader, start=1):
         if max_batches is not None and batch_idx > max_batches:
             break
 
+        update_rigidformer = _should_update_hybrid_rigidformer(cfg, is_train=is_train, batch_idx=batch_idx)
+        if cfg.hybrid_gripper_consistency_loss_weight > 0.0:
+            batch = _ensure_hybrid_pointcloud_batch(batch, loader)
         with torch.set_grad_enabled(is_train):
-            if model.robot_backend == "rwm":
-                if rwm_cfg is None:
-                    raise ValueError("rwm_cfg is required for hybrid_robot_model_type='rwm'.")
-                if hasattr(model.robot, "reset"):
-                    model.robot.reset()
-                robot_loss, robot_metrics = _hybrid_rwm_robot_loss(model, batch, device, cfg, rwm_cfg)
-            else:
-                robot_loss, robot_metrics = _hybrid_delan_robot_loss(model, batch, device, cfg)
+            robot_loss, robot_metrics = _hybrid_robot_loss(model, batch, device, cfg, rwm_cfg)
 
-            rf_loss, rf_breakdown = rigidformer_loss(model, batch, device)
-            loss = cfg.robot_loss_weight * robot_loss + cfg.rigidformer_loss_weight * rf_loss
+            if update_rigidformer:
+                batch = _ensure_hybrid_pointcloud_batch(batch, loader)
+                rf_loss, rf_breakdown = rigidformer_loss(model, batch, device)
+                loss = cfg.robot_loss_weight * robot_loss + cfg.rigidformer_loss_weight * rf_loss
+            else:
+                rf_loss = robot_loss.new_zeros(())
+                rf_breakdown = None
+                loss = cfg.robot_loss_weight * robot_loss
             if not _is_finite(loss):
                 _raise_nonfinite_step(
                     phase,
@@ -1112,8 +1334,6 @@ def run_hybrid_epoch(
                         "robot_loss": robot_loss,
                         "rigidformer_loss": rf_loss,
                         "loss": loss,
-                        "pc_object_pos": batch["pc_object_pos"].to(device),
-                        "pc_object_pos_next": batch["pc_object_pos_next"].to(device),
                     },
                 )
 
@@ -1124,14 +1344,49 @@ def run_hybrid_epoch(
             if not _is_finite(grad_norm):
                 _raise_nonfinite_step(phase, batch_idx, {"loss": loss, "grad_norm": grad_norm})
             optimizer.step()
+            extra_robot_losses: list[torch.Tensor] = []
+            for extra_update_idx in range(1, robot_updates_per_batch):
+                with torch.enable_grad():
+                    extra_robot_loss, _extra_robot_metrics = _hybrid_robot_loss(model, batch, device, cfg, rwm_cfg)
+                    extra_loss = cfg.robot_loss_weight * extra_robot_loss
+                if not _is_finite(extra_loss):
+                    _raise_nonfinite_step(
+                        phase,
+                        batch_idx,
+                        {"extra_robot_loss": extra_robot_loss, "extra_loss": extra_loss},
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                extra_loss.backward()
+                extra_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                if not _is_finite(extra_grad_norm):
+                    _raise_nonfinite_step(
+                        phase,
+                        batch_idx,
+                        {
+                            "extra_robot_loss": extra_robot_loss,
+                            "extra_loss": extra_loss,
+                            "extra_grad_norm": extra_grad_norm,
+                        },
+                    )
+                optimizer.step()
+                extra_robot_losses.append(extra_robot_loss.detach())
 
         metrics = {
             "loss": loss.detach(),
             "robot_loss": robot_loss.detach(),
-            "rigidformer_loss": rf_loss.detach(),
-            "rigidformer_acceleration_loss": rf_breakdown.acceleration.detach(),
-            "rigidformer_position_loss": rf_breakdown.position.detach(),
+            "hybrid_robot_optimizer_steps": robot_loss.new_tensor(float(robot_updates_per_batch)),
+            "hybrid_rigidformer_update_active": robot_loss.new_tensor(1.0 if update_rigidformer else 0.0),
         }
+        if update_rigidformer and rf_breakdown is not None:
+            metrics.update(
+                {
+                    "rigidformer_loss": rf_loss.detach(),
+                    "rigidformer_acceleration_loss": rf_breakdown.acceleration.detach(),
+                    "rigidformer_position_loss": rf_breakdown.position.detach(),
+                }
+            )
+        if is_train and extra_robot_losses:
+            metrics["hybrid_robot_extra_loss"] = torch.stack(extra_robot_losses).mean()
         metrics.update(robot_metrics)
         if not is_train:
             future_states = batch["future_states"].to(device)
@@ -1299,13 +1554,16 @@ def _step_metrics(
 def _format_epoch_summary(
     epoch: int,
     train_metrics: Mapping[str, float],
-    val_metrics: Mapping[str, float],
+    val_metrics: Mapping[str, float] | None,
 ) -> str:
     parts = [
         f"[Epoch {epoch:03d}]",
         f"train_loss={float(train_metrics['loss']):.6f}",
-        f"val_loss={float(val_metrics['loss']):.6f}",
     ]
+    if val_metrics is None:
+        parts.append("val=skipped")
+        return " ".join(parts)
+    parts.append(f"val_loss={float(val_metrics['loss']):.6f}")
     optional_keys = (
         ("rollout_loss", "val_rollout"),
         ("robot_loss", "val_robot"),
@@ -1482,6 +1740,7 @@ def _rollout_eval_argv(cfg: TrainConfig, checkpoint_path: str, output_dir: str) 
             argv.extend(["--pointcloud_file", cfg.pointcloud_file])
         argv.extend(["--hybrid_rollout_feedback_mode", cfg.hybrid_rollout_feedback_mode])
         argv.extend(["--hybrid_gripper_pointcloud_mode", cfg.hybrid_gripper_pointcloud_mode])
+        argv.extend(["--hybrid_rigidformer_predict_objects", cfg.hybrid_rigidformer_predict_objects])
     _optional_arg(argv, "--batch_size", cfg.eval_batch_size)
     _optional_arg(argv, "--max_batches", cfg.eval_max_batches)
     _optional_arg(argv, "--max_episodes", cfg.eval_max_episodes)
@@ -1553,6 +1812,7 @@ def _isaaclab_eval_argv(cfg: TrainConfig, checkpoint_path: str, output_path: str
             argv.extend(["--pointcloud_file", cfg.pointcloud_file])
         argv.extend(["--hybrid_rollout_feedback_mode", cfg.hybrid_rollout_feedback_mode])
         argv.extend(["--hybrid_gripper_pointcloud_mode", cfg.hybrid_gripper_pointcloud_mode])
+        argv.extend(["--hybrid_rigidformer_predict_objects", cfg.hybrid_rigidformer_predict_objects])
     _optional_arg(argv, "--episode_name", cfg.eval_episode_name)
     return argv
 
@@ -1661,6 +1921,14 @@ def _checkpoint_val_loss(checkpoint: Mapping[str, Any]) -> float | None:
     return None
 
 
+def _should_validate_epoch(cfg: TrainConfig, epoch: int) -> bool:
+    if int(epoch) >= int(cfg.epochs):
+        return True
+    if int(cfg.val_every) <= 0:
+        return False
+    return int(epoch) % int(cfg.val_every) == 0
+
+
 def _prepare_resume_config(cfg: TrainConfig) -> None:
     if not cfg.resume_from:
         return
@@ -1733,6 +2001,8 @@ def main(argv: list[str] | None = None) -> None:
     cfg.action_type = _normalize_action_type(cfg.action_type)
     if cfg.render_every < 0:
         raise ValueError("render_every must be >= 0; use 0 to disable periodic rendering.")
+    if cfg.val_every < 0:
+        raise ValueError("val_every must be >= 0; use 0 to validate only on the final epoch.")
     if cfg.eval_isaaclab_video and not cfg.dataset_file:
         raise ValueError("eval_isaaclab_video=True requires dataset_file; dataset_dir is not enough for rendering.")
     model_type = _normalize_model_type(cfg.model_type)
@@ -1781,7 +2051,8 @@ def main(argv: list[str] | None = None) -> None:
     try:
         for epoch in range(start_epoch, cfg.epochs + 1):
             train_metrics = run_epoch(model, train_loader, optimizer, device, cfg, max_train_batches, rwm_cfg)
-            val_metrics = run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg)
+            should_validate = _should_validate_epoch(cfg, epoch)
+            val_metrics = run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg) if should_validate else None
             print(_format_epoch_summary(epoch, train_metrics, val_metrics))
             best_val = checkpoint_and_log_epoch(
                 run=run,
@@ -1798,6 +2069,7 @@ def main(argv: list[str] | None = None) -> None:
                     "data_meta": meta,
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
+                    "validated": should_validate,
                 },
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,

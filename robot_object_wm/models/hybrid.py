@@ -33,8 +33,11 @@ from robot_object_wm.models.utils import (
 
 
 HYBRID_ROBOT_MODEL_TYPES = ("rwm", "delan")
+HYBRID_ROBOT_OUTPUT_MODES = ("full_masked", "robot_only")
 HYBRID_ROLLOUT_FEEDBACK_MODES = ("robot_native", "rigidformer_pose")
 HYBRID_GRIPPER_POINTCLOUD_MODES = ("gt", "predicted_fk")
+HYBRID_RIGIDFORMER_PREDICT_OBJECTS = ("cube", "cube_gripper")
+HYBRID_GRIPPER_CONSISTENCY_GRADIENT_MODES = ("robot", "rigidformer", "both")
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,7 @@ class RigidFormerObjectConfig:
     paper_pointnet_level_dim: int = 256
     pos_loss_weight: float = 10.0
     acc_loss_weight: float = 1.0
+    nearest_neighbor_max_dist: float | None = None
 
 
 def build_rigidformer_object_model(cfg: RigidFormerObjectConfig) -> nn.Module:
@@ -83,6 +87,7 @@ def build_rigidformer_object_model(cfg: RigidFormerObjectConfig) -> nn.Module:
         paper_pointnet_level_dim=cfg.paper_pointnet_level_dim,
         pos_loss_weight=cfg.pos_loss_weight,
         acc_loss_weight=cfg.acc_loss_weight,
+        nearest_neighbor_max_dist=cfg.nearest_neighbor_max_dist,
     )
 
 
@@ -96,6 +101,13 @@ def normalize_hybrid_robot_model_type(value: str) -> str:
     normalized = str(value).strip().lower()
     if normalized not in HYBRID_ROBOT_MODEL_TYPES:
         raise ValueError(f"hybrid_robot_model_type must be one of {HYBRID_ROBOT_MODEL_TYPES}; got {value!r}.")
+    return normalized
+
+
+def normalize_hybrid_robot_output_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in HYBRID_ROBOT_OUTPUT_MODES:
+        raise ValueError(f"hybrid_robot_output_mode must be one of {HYBRID_ROBOT_OUTPUT_MODES}; got {value!r}.")
     return normalized
 
 
@@ -117,6 +129,26 @@ def normalize_hybrid_gripper_pointcloud_mode(value: str) -> str:
     return normalized
 
 
+def normalize_hybrid_rigidformer_predict_objects(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in HYBRID_RIGIDFORMER_PREDICT_OBJECTS:
+        raise ValueError(
+            "hybrid_rigidformer_predict_objects must be one of "
+            f"{HYBRID_RIGIDFORMER_PREDICT_OBJECTS}; got {value!r}."
+        )
+    return normalized
+
+
+def normalize_hybrid_gripper_consistency_gradient_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in HYBRID_GRIPPER_CONSISTENCY_GRADIENT_MODES:
+        raise ValueError(
+            "hybrid_gripper_consistency_gradient_mode must be one of "
+            f"{HYBRID_GRIPPER_CONSISTENCY_GRADIENT_MODES}; got {value!r}."
+        )
+    return normalized
+
+
 class HybridRigidFormerWMDynamics(nn.Module):
     """Robot state-space dynamics plus RigidFormer cube point-cloud dynamics."""
 
@@ -134,6 +166,7 @@ class HybridRigidFormerWMDynamics(nn.Module):
         subtract_env_origin: bool = True,
         pointcloud_file: str | None = None,
         rigidformer_max_points: int = 1024,
+        rigidformer_predict_objects: str = "cube",
     ) -> None:
         super().__init__()
         self.robot = robot
@@ -147,6 +180,7 @@ class HybridRigidFormerWMDynamics(nn.Module):
         self.subtract_env_origin = bool(subtract_env_origin)
         self.pointcloud_file = pointcloud_file
         self.rigidformer_max_points = int(rigidformer_max_points)
+        self.rigidformer_predict_objects = normalize_hybrid_rigidformer_predict_objects(rigidformer_predict_objects)
         self.model_type = "hybrid"
         self.robot_dof = int(layout.robot_dof)
         self.state_dim = int(layout.state_dim)
@@ -411,6 +445,58 @@ class HybridRigidFormerWMDynamics(nn.Module):
             origin=pc["env_origin"] if self.subtract_env_origin else None,
         )
 
+    def gripper_pose_from_points(
+        self,
+        gripper_points: torch.Tensor,
+        pc: dict[str, torch.Tensor],
+        canonical_gripper: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if canonical_gripper is None:
+            canonical_gripper = self._canonical_gripper_points(pc)
+        weights = gripper_hand_point_weights(
+            pc["gripper_part_ids"],
+            pc["object_point_lens"][:, 1],
+            points=gripper_points.shape[1],
+            device=gripper_points.device,
+            dtype=gripper_points.dtype,
+        )
+        rotation, translation = estimate_weighted_row_rigid_transform(
+            canonical_gripper,
+            gripper_points,
+            weights=weights,
+        )
+        return translation, matrix_to_quat(rotation)
+
+    def gripper_pose_from_state(
+        self,
+        state: torch.Tensor,
+        pc: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_abs = self._state_to_absolute_q(state, pc)
+        rotations, translations = self.gripper_fk.link_transforms(q_abs)
+        pos = translations[:, 0]
+        if self.subtract_env_origin:
+            pos = pos + pc["env_origin"]
+        return pos, matrix_to_quat(rotations[:, 0])
+
+    def _compose_rwm_robot_state(self, robot_pred: torch.Tensor, previous_state: torch.Tensor) -> torch.Tensor:
+        if robot_pred.shape[-1] == self.state_dim:
+            return robot_pred
+        indices = getattr(self.robot, "prediction_indices", None)
+        if indices is None:
+            raise ValueError(
+                f"Hybrid RWM returned dim {robot_pred.shape[-1]} but has no prediction_indices to compose "
+                f"a full state_dim={self.state_dim} vector."
+            )
+        if robot_pred.shape[-1] != int(indices.numel()):
+            raise ValueError(
+                f"Hybrid RWM returned dim {robot_pred.shape[-1]}, expected {int(indices.numel())} "
+                "from prediction_indices."
+            )
+        full_state = previous_state.clone()
+        full_state.index_copy_(full_state.dim() - 1, indices.to(full_state.device), robot_pred)
+        return full_state
+
     def _forward_rwm(
         self,
         *,
@@ -448,7 +534,8 @@ class HybridRigidFormerWMDynamics(nn.Module):
             prev_output_state = history_states[:, -1]
             for step in range(action_values.shape[1]):
                 x_action = first_actions if step == 0 else action_values[:, step : step + 1]
-                robot_pred, aleatoric, epistemic = self.robot(x_state, x_action)
+                robot_raw_pred, aleatoric, epistemic = self.robot(x_state, x_action)
+                robot_pred = self._compose_rwm_robot_state(robot_raw_pred, prev_output_state)
                 rf_step = (
                     self._rigidformer_rollout_step(
                         rf_state,
@@ -673,6 +760,60 @@ def estimate_row_rigid_transform(
     else:
         arange = torch.arange(points, device=reference_points.device)
         weights = (arange[None] < point_lens[:, None].clamp_min(0)).to(reference_points.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+    ref_center = (reference_points * weights).sum(dim=1, keepdim=True) / denom
+    tgt_center = (target_points * weights).sum(dim=1, keepdim=True) / denom
+    ref_centered = (reference_points - ref_center) * weights
+    tgt_centered = (target_points - tgt_center) * weights
+    covariance = torch.einsum("bni,bnj->bij", ref_centered, tgt_centered)
+    u, _s, vh = torch.linalg.svd(covariance)
+    rotation = vh.transpose(-1, -2) @ u.transpose(-1, -2)
+    det = torch.linalg.det(rotation)
+    if torch.any(det < 0.0):
+        vh_fixed = vh.clone()
+        vh_fixed[det < 0.0, -1] *= -1.0
+        rotation = vh_fixed.transpose(-1, -2) @ u.transpose(-1, -2)
+    translation = tgt_center.squeeze(1) - torch.einsum(
+        "bi,bji->bj",
+        ref_center.squeeze(1),
+        rotation,
+    )
+    return rotation, translation
+
+
+def gripper_hand_point_weights(
+    part_ids: torch.Tensor,
+    point_lens: torch.Tensor,
+    *,
+    points: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    arange = torch.arange(points, device=device)
+    valid = arange[None, :] < point_lens.to(device=device).clamp_min(0)[:, None]
+    ids = part_ids.to(device=device)
+    if ids.ndim == 1:
+        hand = (ids[:points] == 0)[None, :].expand(valid.shape[0], points)
+    else:
+        hand = ids[:, :points] == 0
+    weights = (valid & hand).to(dtype)
+    has_enough_hand_points = weights.sum(dim=1, keepdim=True) >= 3
+    fallback = valid.to(dtype)
+    return torch.where(has_enough_hand_points, weights, fallback)
+
+
+def estimate_weighted_row_rigid_transform(
+    reference_points: torch.Tensor,
+    target_points: torch.Tensor,
+    *,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate R,t for target ~= reference @ R.T + t with arbitrary per-point weights."""
+    if reference_points.shape != target_points.shape:
+        raise ValueError("reference_points and target_points must have matching shapes.")
+    if weights.shape != reference_points.shape[:2]:
+        raise ValueError("weights must have shape matching reference_points[..., 0].")
+    weights = weights.to(device=reference_points.device, dtype=reference_points.dtype).unsqueeze(-1)
     denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
     ref_center = (reference_points * weights).sum(dim=1, keepdim=True) / denom
     tgt_center = (target_points * weights).sum(dim=1, keepdim=True) / denom
