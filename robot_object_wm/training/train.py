@@ -100,6 +100,7 @@ class TrainConfig:
     robot_loss_weight: float
     rigidformer_loss_weight: float
     hybrid_gripper_consistency_loss_weight: float
+    hybrid_gripper_consistency_start_epoch: int
     hybrid_gripper_consistency_gradient_mode: str
     hybrid_robot_updates_per_batch: int
     hybrid_rigidformer_update_every: int
@@ -575,6 +576,8 @@ def _validate_privileged_collision_model_support(cfg: TrainConfig) -> None:
             raise ValueError("hybrid_rigidformer_update_every must be >= 1.")
         if cfg.hybrid_gripper_consistency_loss_weight < 0.0:
             raise ValueError("hybrid_gripper_consistency_loss_weight must be >= 0.")
+        if cfg.hybrid_gripper_consistency_start_epoch < 1:
+            raise ValueError("hybrid_gripper_consistency_start_epoch must be >= 1.")
         if (
             cfg.hybrid_gripper_consistency_loss_weight > 0.0
             and normalize_hybrid_rigidformer_predict_objects(cfg.hybrid_rigidformer_predict_objects) != "cube_gripper"
@@ -652,7 +655,10 @@ def make_dataloaders(cfg: TrainConfig, rigidformer_cfg: RigidFormerConfig | None
     }
     if _normalize_model_type(cfg.model_type) == "hybrid":
         rigidformer_cfg = rigidformer_cfg or load_rigidformer_config(cfg.rigidformer_config)
-        needs_train_pointcloud_every_batch = cfg.hybrid_gripper_consistency_loss_weight > 0.0
+        needs_train_pointcloud_every_batch = (
+            cfg.hybrid_gripper_consistency_loss_weight > 0.0
+            and cfg.hybrid_gripper_consistency_start_epoch <= 1
+        )
         lazy_train_pointcloud = (
             not needs_train_pointcloud_every_batch
             and (cfg.rigidformer_loss_weight <= 0.0 or cfg.hybrid_rigidformer_update_every > 1)
@@ -1176,9 +1182,11 @@ def _hybrid_gripper_consistency_loss(
     batch: dict[str, Any],
     device: torch.device,
     cfg: TrainConfig,
+    *,
+    active: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weight = float(cfg.hybrid_gripper_consistency_loss_weight)
-    if weight <= 0.0:
+    if weight <= 0.0 or not active:
         zero = next(model.parameters()).new_zeros(())
         return zero, {}
     if normalize_hybrid_rigidformer_predict_objects(cfg.hybrid_rigidformer_predict_objects) != "cube_gripper":
@@ -1249,6 +1257,8 @@ def _hybrid_robot_loss(
     device: torch.device,
     cfg: TrainConfig,
     rwm_cfg: RWMConfig | None,
+    *,
+    consistency_active: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if model.robot_backend == "rwm":
         if rwm_cfg is None:
@@ -1259,7 +1269,15 @@ def _hybrid_robot_loss(
     else:
         base_loss, metrics = _hybrid_delan_robot_loss(model, batch, device, cfg)
 
-    consistency_loss, consistency_metrics = _hybrid_gripper_consistency_loss(model, batch, device, cfg)
+    active_tensor = base_loss.new_tensor(1.0 if consistency_active else 0.0)
+    metrics["hybrid_gripper_consistency_active"] = active_tensor.detach()
+    consistency_loss, consistency_metrics = _hybrid_gripper_consistency_loss(
+        model,
+        batch,
+        device,
+        cfg,
+        active=consistency_active,
+    )
     if consistency_metrics:
         metrics["hybrid_robot_base_loss"] = base_loss.detach()
         metrics.update(consistency_metrics)
@@ -1275,6 +1293,15 @@ def _should_update_hybrid_rigidformer(cfg: TrainConfig, *, is_train: bool, batch
     if cfg.rigidformer_loss_weight <= 0.0:
         return False
     return (int(batch_idx) - 1) % int(cfg.hybrid_rigidformer_update_every) == 0
+
+
+def _hybrid_gripper_consistency_active(cfg: TrainConfig, epoch: int | None) -> bool:
+    if cfg.hybrid_gripper_consistency_loss_weight <= 0.0:
+        return False
+    start_epoch = int(cfg.hybrid_gripper_consistency_start_epoch)
+    if epoch is None:
+        return start_epoch <= 1
+    return int(epoch) >= start_epoch
 
 
 def _ensure_hybrid_pointcloud_batch(batch: dict[str, Any], loader: DataLoader) -> dict[str, Any]:
@@ -1300,6 +1327,7 @@ def run_hybrid_epoch(
     cfg: TrainConfig,
     rwm_cfg: RWMConfig | None,
     max_batches: int | None,
+    epoch: int | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -1307,16 +1335,24 @@ def run_hybrid_epoch(
     num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     phase = "train" if is_train else "val"
     robot_updates_per_batch = int(cfg.hybrid_robot_updates_per_batch) if is_train else 1
+    consistency_active = _hybrid_gripper_consistency_active(cfg, epoch)
 
     for batch_idx, batch in enumerate(loader, start=1):
         if max_batches is not None and batch_idx > max_batches:
             break
 
         update_rigidformer = _should_update_hybrid_rigidformer(cfg, is_train=is_train, batch_idx=batch_idx)
-        if cfg.hybrid_gripper_consistency_loss_weight > 0.0:
+        if consistency_active:
             batch = _ensure_hybrid_pointcloud_batch(batch, loader)
         with torch.set_grad_enabled(is_train):
-            robot_loss, robot_metrics = _hybrid_robot_loss(model, batch, device, cfg, rwm_cfg)
+            robot_loss, robot_metrics = _hybrid_robot_loss(
+                model,
+                batch,
+                device,
+                cfg,
+                rwm_cfg,
+                consistency_active=consistency_active,
+            )
 
             if update_rigidformer:
                 batch = _ensure_hybrid_pointcloud_batch(batch, loader)
@@ -1347,7 +1383,14 @@ def run_hybrid_epoch(
             extra_robot_losses: list[torch.Tensor] = []
             for extra_update_idx in range(1, robot_updates_per_batch):
                 with torch.enable_grad():
-                    extra_robot_loss, _extra_robot_metrics = _hybrid_robot_loss(model, batch, device, cfg, rwm_cfg)
+                    extra_robot_loss, _extra_robot_metrics = _hybrid_robot_loss(
+                        model,
+                        batch,
+                        device,
+                        cfg,
+                        rwm_cfg,
+                        consistency_active=consistency_active,
+                    )
                     extra_loss = cfg.robot_loss_weight * extra_robot_loss
                 if not _is_finite(extra_loss):
                     _raise_nonfinite_step(
@@ -1410,9 +1453,10 @@ def run_epoch(
     cfg: TrainConfig,
     max_batches: int | None,
     rwm_cfg: RWMConfig | None = None,
+    epoch: int | None = None,
 ) -> dict[str, float]:
     if _normalize_model_type(cfg.model_type) == "hybrid":
-        return run_hybrid_epoch(model, loader, optimizer, device, cfg, rwm_cfg, max_batches)
+        return run_hybrid_epoch(model, loader, optimizer, device, cfg, rwm_cfg, max_batches, epoch=epoch)
     if _normalize_model_type(cfg.model_type) == "rwm":
         if rwm_cfg is None:
             raise ValueError("rwm_cfg is required when model_type='rwm'.")
@@ -2003,6 +2047,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("render_every must be >= 0; use 0 to disable periodic rendering.")
     if cfg.val_every < 0:
         raise ValueError("val_every must be >= 0; use 0 to validate only on the final epoch.")
+    if cfg.hybrid_gripper_consistency_start_epoch < 1:
+        raise ValueError("hybrid_gripper_consistency_start_epoch must be >= 1.")
     if cfg.eval_isaaclab_video and not cfg.dataset_file:
         raise ValueError("eval_isaaclab_video=True requires dataset_file; dataset_dir is not enough for rendering.")
     model_type = _normalize_model_type(cfg.model_type)
@@ -2050,9 +2096,22 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         for epoch in range(start_epoch, cfg.epochs + 1):
-            train_metrics = run_epoch(model, train_loader, optimizer, device, cfg, max_train_batches, rwm_cfg)
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                cfg,
+                max_train_batches,
+                rwm_cfg,
+                epoch=epoch,
+            )
             should_validate = _should_validate_epoch(cfg, epoch)
-            val_metrics = run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg) if should_validate else None
+            val_metrics = (
+                run_epoch(model, val_loader, None, device, cfg, None, rwm_cfg, epoch=epoch)
+                if should_validate
+                else None
+            )
             print(_format_epoch_summary(epoch, train_metrics, val_metrics))
             best_val = checkpoint_and_log_epoch(
                 run=run,

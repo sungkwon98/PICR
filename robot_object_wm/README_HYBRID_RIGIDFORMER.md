@@ -35,6 +35,7 @@ hybrid_rigidformer_predict_objects: cube_gripper  # cube or cube_gripper
 robot_loss_weight: 1.0
 rigidformer_loss_weight: 1.0
 hybrid_gripper_consistency_loss_weight: 1.0  # 0 disables RF-gripper/FK-gripper robot loss
+hybrid_gripper_consistency_start_epoch: 10  # 1 starts immediately
 hybrid_gripper_consistency_gradient_mode: both  # robot, rigidformer, or both
 hybrid_robot_updates_per_batch: 1
 hybrid_rigidformer_update_every: 1
@@ -76,6 +77,7 @@ Robot gripper consistency loss:
 - `hybrid_gripper_consistency_loss_weight > 0` adds a pose-space auxiliary loss for `cube_gripper` training. The robot model predicts `q(t+1)`, differentiable FK converts it to gripper pose/orientation, and the one-step RigidFormer gripper point-cloud prediction is converted back to gripper pose/orientation with Kabsch on the rigid hand points.
 - The regular `cube_gripper` RigidFormer loss is still supervised from the ground-truth next gripper point cloud in the HDF5. The consistency term compares the two model predictions in pose space.
 - `hybrid_gripper_consistency_gradient_mode` controls which model receives consistency gradients: `robot`, `rigidformer`, or `both`.
+- `hybrid_gripper_consistency_start_epoch` is 1-indexed. Before that epoch, the consistency loss is skipped; this avoids large early gradients while the robot and RigidFormer predictions are still unstable.
 - Set `hybrid_gripper_consistency_loss_weight: 0.0` to disable it.
 
 ## Training
@@ -139,6 +141,7 @@ Train RigidFormer on both cube and gripper:
   --config robot_object_wm/configs/train_config.yaml \
   --hybrid_rigidformer_predict_objects cube_gripper \
   --hybrid_gripper_consistency_loss_weight 1.0 \
+  --hybrid_gripper_consistency_start_epoch 10 \
   --hybrid_gripper_consistency_gradient_mode both
 ```
 

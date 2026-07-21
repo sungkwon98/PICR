@@ -19,6 +19,7 @@ hybrid_rigidformer_predict_objects: cube_gripper # cube or cube_gripper
 robot_loss_weight: 1.0
 rigidformer_loss_weight: 1.0
 hybrid_gripper_consistency_loss_weight: .1 # 0 disables robot-FK vs RF-gripper consistency
+hybrid_gripper_consistency_start_epoch: 10 # 1 starts immediately
 hybrid_gripper_consistency_gradient_mode: both # robot, rigidformer, or both
 # Hybrid training schedule. Robot-only updates are cheap, while RigidFormer
 # point-cloud updates are expensive. Defaults reproduce the original behavior.
@@ -118,7 +119,7 @@ wandb_artifacts: true
 eval_after_train: true
 eval_fail_on_error: false
 # 0 disables periodic rendering. Positive values render/log every N epochs.
-render_every: 5
+render_every: 1
 eval_output_dir: eval
 eval_split: val
 eval_batch_size:
@@ -129,7 +130,7 @@ eval_num_workers: 0
 eval_episode_plot: true
 eval_episode_index: 26
 eval_episode_name:
-eval_start_t: 25
+eval_start_t: 0
 eval_rollout_steps: 0
 eval_target: gripper
 
