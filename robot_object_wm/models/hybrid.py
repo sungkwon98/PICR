@@ -450,7 +450,9 @@ class HybridRigidFormerWMDynamics(nn.Module):
         gripper_points: torch.Tensor,
         pc: dict[str, torch.Tensor],
         canonical_gripper: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        return_valid_mask: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if canonical_gripper is None:
             canonical_gripper = self._canonical_gripper_points(pc)
         weights = gripper_hand_point_weights(
@@ -460,12 +462,16 @@ class HybridRigidFormerWMDynamics(nn.Module):
             device=gripper_points.device,
             dtype=gripper_points.dtype,
         )
-        rotation, translation = estimate_weighted_row_rigid_transform(
+        rotation, translation, valid_mask = estimate_weighted_row_rigid_transform(
             canonical_gripper,
             gripper_points,
             weights=weights,
+            return_valid_mask=True,
         )
-        return translation, matrix_to_quat(rotation)
+        quat = matrix_to_quat(rotation)
+        if return_valid_mask:
+            return translation, quat, valid_mask
+        return translation, quat
 
     def gripper_pose_from_state(
         self,
@@ -807,19 +813,36 @@ def estimate_weighted_row_rigid_transform(
     target_points: torch.Tensor,
     *,
     weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_valid_mask: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Estimate R,t for target ~= reference @ R.T + t with arbitrary per-point weights."""
     if reference_points.shape != target_points.shape:
         raise ValueError("reference_points and target_points must have matching shapes.")
     if weights.shape != reference_points.shape[:2]:
         raise ValueError("weights must have shape matching reference_points[..., 0].")
-    weights = weights.to(device=reference_points.device, dtype=reference_points.dtype).unsqueeze(-1)
+    batch = reference_points.shape[0]
+    device = reference_points.device
+    dtype = reference_points.dtype
+    weights = weights.to(device=device, dtype=dtype)
+    finite_points = torch.isfinite(reference_points).all(dim=-1) & torch.isfinite(target_points).all(dim=-1)
+    finite_weights = torch.isfinite(weights) & (weights > 0.0)
+    weights = torch.where(finite_points & finite_weights, weights, torch.zeros_like(weights))
+    valid_mask = weights.gt(0.0).sum(dim=1) >= 3
+    weights = weights.unsqueeze(-1)
+
+    reference_points = torch.nan_to_num(reference_points, nan=0.0, posinf=0.0, neginf=0.0)
+    target_points = torch.nan_to_num(target_points, nan=0.0, posinf=0.0, neginf=0.0)
     denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
     ref_center = (reference_points * weights).sum(dim=1, keepdim=True) / denom
     tgt_center = (target_points * weights).sum(dim=1, keepdim=True) / denom
     ref_centered = (reference_points - ref_center) * weights
     tgt_centered = (target_points - tgt_center) * weights
     covariance = torch.einsum("bni,bnj->bij", ref_centered, tgt_centered)
+    fallback_covariance = torch.diag(
+        torch.tensor([1.0, 2.0, 3.0], device=device, dtype=dtype)
+    ).expand(batch, 3, 3)
+    covariance = torch.where(valid_mask[:, None, None], covariance, fallback_covariance)
+    covariance = torch.nan_to_num(covariance, nan=0.0, posinf=0.0, neginf=0.0)
     u, _s, vh = torch.linalg.svd(covariance)
     rotation = vh.transpose(-1, -2) @ u.transpose(-1, -2)
     det = torch.linalg.det(rotation)
@@ -832,6 +855,14 @@ def estimate_weighted_row_rigid_transform(
         ref_center.squeeze(1),
         rotation,
     )
+    identity = torch.eye(3, device=device, dtype=dtype).expand(batch, 3, 3)
+    zero_translation = torch.zeros((batch, 3), device=device, dtype=dtype)
+    rotation = torch.where(valid_mask[:, None, None], rotation, identity)
+    translation = torch.where(valid_mask[:, None], translation, zero_translation)
+    rotation = torch.nan_to_num(rotation, nan=0.0, posinf=0.0, neginf=0.0)
+    translation = torch.nan_to_num(translation, nan=0.0, posinf=0.0, neginf=0.0)
+    if return_valid_mask:
+        return rotation, translation, valid_mask
     return rotation, translation
 
 

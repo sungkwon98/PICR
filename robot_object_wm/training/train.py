@@ -949,6 +949,18 @@ def _is_finite(tensor: torch.Tensor) -> bool:
     return bool(torch.isfinite(tensor).all().detach().cpu().item())
 
 
+def _finite_batch_mask(*tensors: torch.Tensor) -> torch.Tensor:
+    if not tensors:
+        raise ValueError("_finite_batch_mask requires at least one tensor.")
+    batch = tensors[0].shape[0]
+    mask = torch.ones(batch, device=tensors[0].device, dtype=torch.bool)
+    for tensor in tensors:
+        if tensor.shape[0] != batch:
+            raise ValueError("All tensors must share the same batch dimension.")
+        mask = mask & torch.isfinite(tensor).reshape(batch, -1).all(dim=1)
+    return mask
+
+
 def _tensor_summary(name: str, tensor: torch.Tensor) -> str:
     value = tensor.detach()
     finite = torch.isfinite(value)
@@ -1222,7 +1234,12 @@ def _hybrid_gripper_consistency_loss(
             object_point_lens=pc["object_point_lens"],
         )
         rf_gripper_points = rf_pred.object_pos_next[:, 1]
-        rf_pos, rf_quat = model.gripper_pose_from_points(rf_gripper_points, pc, canonical_gripper)
+        rf_pos, rf_quat, rf_pose_valid = model.gripper_pose_from_points(
+            rf_gripper_points,
+            pc,
+            canonical_gripper,
+            return_valid_mask=True,
+        )
 
     if grad_mode == "robot":
         rf_pos = rf_pos.detach()
@@ -1231,21 +1248,67 @@ def _hybrid_gripper_consistency_loss(
         robot_pos = robot_pos.detach()
         robot_quat = robot_quat.detach()
 
-    pos_loss = torch.nn.functional.mse_loss(robot_pos, rf_pos)
-    orient_loss = quat_angle_error(robot_quat, rf_quat).square().mean()
+    pose_valid = rf_pose_valid & _finite_batch_mask(robot_pos, robot_quat, rf_pos, rf_quat)
+    valid_count = int(pose_valid.sum().detach().cpu().item())
+    total_count = int(pose_valid.numel())
+    zero = robot_pos.new_zeros(())
+    if valid_count > 0:
+        selected_robot_pos = robot_pos[pose_valid]
+        selected_rf_pos = rf_pos[pose_valid]
+        selected_robot_quat = robot_quat[pose_valid]
+        selected_rf_quat = rf_quat[pose_valid]
+        angle_error = quat_angle_error(selected_robot_quat, selected_rf_quat)
+        angle_valid = torch.isfinite(angle_error)
+        angle_valid_count = int(angle_valid.sum().detach().cpu().item())
+        if angle_valid_count > 0:
+            selected_robot_pos = selected_robot_pos[angle_valid]
+            selected_rf_pos = selected_rf_pos[angle_valid]
+            angle_error = angle_error[angle_valid]
+            pos_loss = torch.nn.functional.mse_loss(selected_robot_pos, selected_rf_pos)
+            orient_loss = angle_error.square().mean()
+            valid_count = angle_valid_count
+        else:
+            pos_loss = zero
+            orient_loss = zero
+            valid_count = 0
+    else:
+        pos_loss = zero
+        orient_loss = zero
     loss = pos_loss + orient_loss
     weighted = loss * weight
 
     with torch.no_grad():
-        gt_pos, gt_quat = model.gripper_pose_from_points(pc["object_pos_next"][:, 1], pc, canonical_gripper)
-        rf_gt_pos_mse = torch.nn.functional.mse_loss(rf_pos.detach(), gt_pos)
-        rf_gt_orient_rmse = quat_angle_error(rf_quat.detach(), gt_quat).square().mean().sqrt()
+        gt_pos, gt_quat, gt_pose_valid = model.gripper_pose_from_points(
+            pc["object_pos_next"][:, 1],
+            pc,
+            canonical_gripper,
+            return_valid_mask=True,
+        )
+        gt_metric_valid = gt_pose_valid & rf_pose_valid.detach() & _finite_batch_mask(
+            rf_pos.detach(),
+            rf_quat.detach(),
+            gt_pos,
+            gt_quat,
+        )
+        gt_metric_count = int(gt_metric_valid.sum().detach().cpu().item())
+        if gt_metric_count > 0:
+            rf_gt_pos_mse = torch.nn.functional.mse_loss(rf_pos.detach()[gt_metric_valid], gt_pos[gt_metric_valid])
+            rf_gt_angle = quat_angle_error(rf_quat.detach()[gt_metric_valid], gt_quat[gt_metric_valid])
+            rf_gt_angle = rf_gt_angle[torch.isfinite(rf_gt_angle)]
+            rf_gt_orient_rmse = rf_gt_angle.square().mean().sqrt() if rf_gt_angle.numel() > 0 else zero.detach()
+        else:
+            rf_gt_pos_mse = zero.detach()
+            rf_gt_orient_rmse = zero.detach()
+    valid_fraction = zero.detach() + (float(valid_count) / float(max(total_count, 1)))
+    skipped_count = zero.detach() + float(total_count - valid_count)
 
     return weighted, {
         "hybrid_gripper_consistency_loss": loss.detach(),
         "hybrid_gripper_consistency_position_mse": pos_loss.detach(),
         "hybrid_gripper_consistency_orientation_mse": orient_loss.detach(),
         "hybrid_gripper_consistency_weighted_loss": weighted.detach(),
+        "hybrid_gripper_consistency_valid_fraction": valid_fraction,
+        "hybrid_gripper_consistency_skipped_samples": skipped_count,
         "hybrid_rf_gripper_gt_pose_position_mse": rf_gt_pos_mse.detach(),
         "hybrid_rf_gripper_gt_pose_orientation_rmse_rad": rf_gt_orient_rmse.detach(),
     }

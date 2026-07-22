@@ -8,7 +8,7 @@ import torch
 
 from robot_object_wm.data.rollout_dataset import RobotObjectWMRolloutDataset
 from robot_object_wm.data.hdf5_schema import make_robot_object_state_layout
-from robot_object_wm.models.hybrid import pose_from_cube_points, quat_angle_error
+from robot_object_wm.models.hybrid import estimate_weighted_row_rigid_transform, pose_from_cube_points, quat_angle_error
 
 
 def _write_state_hdf5(path, *, steps: int = 6) -> None:
@@ -162,3 +162,40 @@ def test_pose_from_cube_points_recovers_translation_and_rotation():
     target_quat = torch.tensor([[np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)]], dtype=torch.float32)
     assert torch.allclose(pos, target_pos, atol=1.0e-5)
     assert torch.all(quat_angle_error(quat, target_quat) < 1.0e-4)
+
+
+def test_weighted_rigid_transform_masks_nonfinite_points():
+    reference = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    translation = torch.tensor([[0.2, -0.1, 0.3], [0.0, 0.0, 0.0]], dtype=torch.float32)
+    target = reference + translation[:, None]
+    target[0, 0] = float("nan")
+    target[1, :2] = float("nan")
+    weights = torch.ones((2, 4), dtype=torch.float32)
+
+    rotation, recovered_translation, valid = estimate_weighted_row_rigid_transform(
+        reference,
+        target,
+        weights=weights,
+        return_valid_mask=True,
+    )
+
+    assert valid.tolist() == [True, False]
+    assert torch.isfinite(rotation).all()
+    assert torch.isfinite(recovered_translation).all()
+    assert torch.allclose(recovered_translation[0], translation[0], atol=1.0e-5)
